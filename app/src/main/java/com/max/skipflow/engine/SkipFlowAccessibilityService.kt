@@ -2,13 +2,17 @@ package com.max.skipflow.engine
 
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.GestureDescription
+import android.content.BroadcastReceiver
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.graphics.Path
 import android.graphics.Rect
 import android.media.AudioManager
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.os.PowerManager
 import android.os.SystemClock
 import android.os.VibrationEffect
 import android.os.Vibrator
@@ -21,20 +25,32 @@ import android.view.accessibility.AccessibilityWindowInfo
 import android.widget.Toast
 import com.max.skipflow.SkipFlowApplication
 import com.max.skipflow.data.SkipFlowRepository
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 import java.util.ArrayDeque
 
 class SkipFlowAccessibilityService : AccessibilityService() {
 
     private lateinit var repository: SkipFlowRepository
     private lateinit var audioManager: AudioManager
+    private lateinit var powerManager: PowerManager
     private lateinit var volumeController: YouTubeVolumeController
 
     private val mainHandler = Handler(Looper.getMainLooper())
+    private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private val multiStageStateMachine = MultiStageAdStateMachine()
 
+    private var pollingJob: Job? = null
+    private var activeMonitoredPackage: String? = null
     private var lastScanElapsedMs: Long = 0L
     private var lastEnabledGamePackage: String? = null
     private var lastEnabledGameActiveAtMs: Long = 0L
@@ -42,12 +58,29 @@ class SkipFlowAccessibilityService : AccessibilityService() {
     private var lastWindowClassName: String? = null
     private var lastToastShownAtMs: Long = 0L
     private var pendingVolumeRestoreRunnable: Runnable? = null
+    private var isScreenReceiverRegistered: Boolean = false
+
+    private val screenStateReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            when (intent?.action) {
+                Intent.ACTION_SCREEN_OFF -> stopCountdownPolling()
+                Intent.ACTION_SCREEN_ON, Intent.ACTION_USER_PRESENT -> {
+                    val pkg = activeMonitoredPackage
+                    if (pkg != null && repository.settings.value.engineEnabled) {
+                        ensureCountdownPollingActive()
+                    }
+                }
+            }
+        }
+    }
 
     override fun onCreate() {
         super.onCreate()
         repository = SkipFlowApplication.from(this).container.skipFlowRepository
         audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
         volumeController = YouTubeVolumeController(AndroidMediaVolumeBackend(audioManager))
+        registerScreenStateReceiver()
     }
 
     override fun onServiceConnected() {
@@ -58,6 +91,9 @@ class SkipFlowAccessibilityService : AccessibilityService() {
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         val currentSettings = repository.settings.value
         if (!currentSettings.engineEnabled) {
+            stopCountdownPolling()
+            activeMonitoredPackage = null
+            _currentActivePackage.value = null
             volumeController.forceRestore()
             return
         }
@@ -82,7 +118,7 @@ class SkipFlowAccessibilityService : AccessibilityService() {
 
         val disabledPackages = repository.disabledPackages.value
 
-        // Context-Aware O(1) idle check: zero tree traversal for system or disabled apps
+        // Context-Aware O(1) idle check: zero tree traversal or polling for system or disabled apps
         val monitoredPackage = resolveMonitoredPackage(
             eventPkg = eventPkg,
             eventClassName = event.className,
@@ -90,44 +126,179 @@ class SkipFlowAccessibilityService : AccessibilityService() {
             nowElapsed = nowElapsed
         )
         if (monitoredPackage == null) {
+            activeMonitoredPackage = null
             _currentActivePackage.value = null
+            stopCountdownPolling()
             if (eventPkg != AdDetectionRules.YOUTUBE_PACKAGE) {
                 volumeController.forceRestore()
             }
             return
         }
 
+        activeMonitoredPackage = monitoredPackage
         _currentActivePackage.value = monitoredPackage
 
         // Pause automatically during phone/VoIP calls
         if (currentSettings.pauseDuringCalls && CallStateMonitor.isCallActive(audioManager)) {
+            stopCountdownPolling()
             volumeController.forceRestore()
             return
         }
 
-        // Throttle rapid window content updates while keeping response fast
+        // Start lightweight 800ms countdown polling while an enabled app/game is foregrounded
+        ensureCountdownPollingActive()
+
         val minInterval = if (isWindowChange) WINDOW_STATE_SCAN_GAP_MS else CONTENT_SCAN_THROTTLE_MS
         if (nowElapsed - lastScanElapsedMs < minInterval) {
             return
         }
-        lastScanElapsedMs = nowElapsed
 
-        val candidateWindows = collectCandidateRootNodes(monitoredPackage)
+        performMultiWindowScan(
+            monitoredPackage = monitoredPackage,
+            eventClassName = event.className,
+            nowElapsed = nowElapsed
+        )
+    }
+
+    override fun onInterrupt() {
+        stopCountdownPolling()
+        cancelPendingVolumeRestore()
+        volumeController.forceRestore()
+        _isServiceConnected.value = false
+    }
+
+    override fun onUnbind(intent: android.content.Intent?): Boolean {
+        stopCountdownPolling()
+        cancelPendingVolumeRestore()
+        volumeController.forceRestore()
+        _isServiceConnected.value = false
+        activeMonitoredPackage = null
+        _currentActivePackage.value = null
+        return super.onUnbind(intent)
+    }
+
+    override fun onDestroy() {
+        stopCountdownPolling()
+        cancelPendingVolumeRestore()
+        volumeController.forceRestore()
+        unregisterScreenStateReceiver()
+        serviceScope.cancel()
+        _isServiceConnected.value = false
+        activeMonitoredPackage = null
+        _currentActivePackage.value = null
+        super.onDestroy()
+    }
+
+    private fun ensureCountdownPollingActive() {
+        if (!powerManager.isInteractive) {
+            stopCountdownPolling()
+            return
+        }
+        if (pollingJob?.isActive == true) return
+
+        pollingJob = serviceScope.launch {
+            while (isActive) {
+                delay(COUNTDOWN_POLLING_INTERVAL_MS)
+                val settings = repository.settings.value
+                if (!settings.engineEnabled || !powerManager.isInteractive) {
+                    stopCountdownPolling()
+                    break
+                }
+                if (settings.pauseDuringCalls && CallStateMonitor.isCallActive(audioManager)) {
+                    continue
+                }
+
+                val nowElapsed = SystemClock.elapsedRealtime()
+                val liveMonitoredPkg = resolveForegroundMonitoredPackage(nowElapsed)
+                if (liveMonitoredPkg == null) {
+                    activeMonitoredPackage = null
+                    _currentActivePackage.value = null
+                    volumeController.forceRestore()
+                    stopCountdownPolling()
+                    break
+                }
+
+                activeMonitoredPackage = liveMonitoredPkg
+                _currentActivePackage.value = liveMonitoredPkg
+
+                if (nowElapsed - lastScanElapsedMs >= POLLING_MIN_SCAN_GAP_MS) {
+                    performMultiWindowScan(
+                        monitoredPackage = liveMonitoredPkg,
+                        eventClassName = null,
+                        nowElapsed = nowElapsed
+                    )
+                }
+            }
+        }
+    }
+
+    private fun stopCountdownPolling() {
+        pollingJob?.cancel()
+        pollingJob = null
+    }
+
+    private fun resolveForegroundMonitoredPackage(nowElapsed: Long): String? {
+        val disabledPackages = repository.disabledPackages.value
+        val activeRoot = rootInActiveWindow
+        val activePkg = try {
+            activeRoot?.packageName?.toString()
+        } finally {
+            if (activeRoot != null) safeRecycle(activeRoot)
+        }
+
+        if (!activePkg.isNullOrBlank()) {
+            if (activePkg == packageName || AdDetectionRules.isSystemPackage(activePkg) || activePkg in disabledPackages) {
+                return null
+            }
+            if (!AdDetectionRules.isInputMethodPackage(activePkg)) {
+                return resolveMonitoredPackage(
+                    eventPkg = activePkg,
+                    eventClassName = null,
+                    disabledPackages = disabledPackages,
+                    nowElapsed = nowElapsed
+                )
+            }
+        }
+
+        return activeMonitoredPackage?.takeIf {
+            it != packageName && !AdDetectionRules.isSystemPackage(it) && it !in disabledPackages
+        }
+    }
+
+    private fun performMultiWindowScan(
+        monitoredPackage: String,
+        eventClassName: CharSequence?,
+        nowElapsed: Long
+    ) {
+        lastScanElapsedMs = nowElapsed
+        val currentSettings = repository.settings.value
+        val candidateWindows = collectAllApplicationWindowRoots(
+            monitoredPackage = monitoredPackage,
+            disabledPackages = repository.disabledPackages.value
+        )
         if (candidateWindows.isEmpty()) return
 
         var hasYouTubeAd = false
         var bestCandidate: CandidateMatch? = null
 
         try {
-            val adActivityContext = AdDetectionRules.isAdActivityName(event.className) ||
-                (lastWindowPackage == eventPkg && AdDetectionRules.isAdActivityName(lastWindowClassName)) ||
-                eventPkg == AdDetectionRules.ADMOB_AD_ACTIVITY_PACKAGE
+            val adActivityContext = AdDetectionRules.isAdActivityName(eventClassName) ||
+                (lastWindowPackage == monitoredPackage && AdDetectionRules.isAdActivityName(lastWindowClassName)) ||
+                monitoredPackage == AdDetectionRules.ADMOB_AD_ACTIVITY_PACKAGE
 
             for (root in candidateWindows) {
+                val rootPkg = root.packageName?.toString()
+                val windowPackage = when {
+                    rootPkg.isNullOrBlank() -> monitoredPackage
+                    rootPkg == AdDetectionRules.ADMOB_AD_ACTIVITY_PACKAGE -> monitoredPackage
+                    else -> rootPkg
+                }
                 val result = scanWindowTree(
                     root = root,
-                    monitoredPackage = monitoredPackage,
-                    initialAdActivityHint = adActivityContext || AdDetectionRules.isAdActivityName(root.className)
+                    monitoredPackage = windowPackage,
+                    initialAdActivityHint = adActivityContext ||
+                        AdDetectionRules.isAdActivityName(root.className) ||
+                        AdDetectionRules.isAdActivityName(rootPkg)
                 )
                 if (result.hasYouTubeAdIndicator) {
                     hasYouTubeAd = true
@@ -171,28 +342,6 @@ class SkipFlowAccessibilityService : AccessibilityService() {
         }
     }
 
-    override fun onInterrupt() {
-        cancelPendingVolumeRestore()
-        volumeController.forceRestore()
-        _isServiceConnected.value = false
-    }
-
-    override fun onUnbind(intent: android.content.Intent?): Boolean {
-        cancelPendingVolumeRestore()
-        volumeController.forceRestore()
-        _isServiceConnected.value = false
-        _currentActivePackage.value = null
-        return super.onUnbind(intent)
-    }
-
-    override fun onDestroy() {
-        cancelPendingVolumeRestore()
-        volumeController.forceRestore()
-        _isServiceConnected.value = false
-        _currentActivePackage.value = null
-        super.onDestroy()
-    }
-
     private fun resolveMonitoredPackage(
         eventPkg: String,
         eventClassName: CharSequence?,
@@ -229,28 +378,43 @@ class SkipFlowAccessibilityService : AccessibilityService() {
         return eventPkg
     }
 
-    private fun collectCandidateRootNodes(monitoredPackage: String): List<AccessibilityNodeInfo> {
+    /**
+     * Collects ALL non-system TYPE_APPLICATION windows from service.windows (plus rootInActiveWindow)
+     * so game ad overlays displayed in separate windows are never missed.
+     */
+    private fun collectAllApplicationWindowRoots(
+        monitoredPackage: String,
+        disabledPackages: Set<String>
+    ): List<AccessibilityNodeInfo> {
         val roots = mutableListOf<AccessibilityNodeInfo>()
-        rootInActiveWindow?.let { roots.add(it) }
 
         runCatching {
             for (window in windows) {
                 if (window.type != AccessibilityWindowInfo.TYPE_APPLICATION) continue
                 val winRoot = window.root ?: continue
                 val winPkg = winRoot.packageName?.toString()
-                val alreadyAdded = roots.any { it == winRoot }
-                if (!alreadyAdded &&
-                    (winPkg == monitoredPackage ||
-                        winPkg == AdDetectionRules.ADMOB_AD_ACTIVITY_PACKAGE ||
-                        (winPkg != null && !AdDetectionRules.isSystemPackage(winPkg)))
-                ) {
+                val allowed = winPkg == null ||
+                    winPkg == monitoredPackage ||
+                    winPkg == AdDetectionRules.ADMOB_AD_ACTIVITY_PACKAGE ||
+                    (!AdDetectionRules.isSystemPackage(winPkg) &&
+                        !AdDetectionRules.isInputMethodPackage(winPkg) &&
+                        winPkg !in disabledPackages)
+                if (allowed && roots.none { it == winRoot }) {
                     roots.add(winRoot)
                 } else {
                     safeRecycle(winRoot)
                 }
-                if (roots.size >= 3) break
             }
         }
+
+        rootInActiveWindow?.let { activeRoot ->
+            if (roots.none { it == activeRoot }) {
+                roots.add(activeRoot)
+            } else {
+                safeRecycle(activeRoot)
+            }
+        }
+
         return roots
     }
 
@@ -312,8 +476,9 @@ class SkipFlowAccessibilityService : AccessibilityService() {
         initialAdActivityHint: Boolean
     ): TreeScanResult {
         val (screenW, screenH, density) = getScreenMetrics()
-        val queue = ArrayDeque<Pair<AccessibilityNodeInfo, Int>>()
-        queue.add(root to 0)
+        val queue = ArrayDeque<Triple<AccessibilityNodeInfo, Int, Boolean>>()
+        val rootIsWebView = root.className?.toString()?.contains("WebView", ignoreCase = true) == true
+        queue.add(Triple(root, 0, rootIsWebView))
 
         var visitedNodes = 0
         var hasYouTubeAd = false
@@ -324,7 +489,7 @@ class SkipFlowAccessibilityService : AccessibilityService() {
         val isYouTube = monitoredPackage == AdDetectionRules.YOUTUBE_PACKAGE
 
         while (queue.isNotEmpty() && visitedNodes < MAX_SCAN_NODES) {
-            val (node, depth) = queue.removeFirst()
+            val (node, depth, insideWebView) = queue.removeFirst()
             visitedNodes++
 
             val isRoot = node === root
@@ -332,7 +497,9 @@ class SkipFlowAccessibilityService : AccessibilityService() {
                 val viewId = node.viewIdResourceName
                 val text = node.text
                 val desc = node.contentDescription
-                val visible = node.isVisibleToUser
+                val clsName = node.className?.toString()
+                val isWebViewNode = insideWebView || (clsName?.contains("WebView", ignoreCase = true) == true)
+                val visible = node.isVisibleToUser || isWebViewNode
 
                 if (isYouTube) {
                     if (!hasYouTubeAd && visible && AdDetectionRules.isYouTubeAdIndicator(viewId, text, desc)) {
@@ -371,7 +538,7 @@ class SkipFlowAccessibilityService : AccessibilityService() {
                                 }
                             }
                         }
-                    } else if (!isYouTube && isCornerIconCandidateClass(node)) {
+                    } else if (!isYouTube && isCornerIconCandidateClass(node, isWebViewNode)) {
                         node.getBoundsInScreen(tempRect)
                         val iconBounds = BoundsRect(tempRect.left, tempRect.top, tempRect.right, tempRect.bottom)
                         if (SafeZoneEvaluator.isCornerAdIconSize(iconBounds, screenW, screenH, density) &&
@@ -394,7 +561,7 @@ class SkipFlowAccessibilityService : AccessibilityService() {
                     val childCount = node.childCount
                     for (i in 0 until childCount) {
                         val child = node.getChild(i) ?: continue
-                        queue.add(child to (depth + 1))
+                        queue.add(Triple(child, depth + 1, isWebViewNode))
                     }
                 }
             } finally {
@@ -405,14 +572,14 @@ class SkipFlowAccessibilityService : AccessibilityService() {
         }
 
         while (queue.isNotEmpty()) {
-            val (remaining, _) = queue.removeFirst()
+            val (remaining, _, _) = queue.removeFirst()
             if (remaining !== root) {
                 safeRecycle(remaining)
             }
         }
 
         // If no explicit text/ID match was found and we are inside a game Ad window,
-        // pick the top-corner >> / X icon candidate.
+        // pick the top-16% far-left/far-right corner >> / X icon candidate.
         if (bestCandidate == null && !isYouTube && isGameAdScreen && cornerIconCandidates.isNotEmpty()) {
             val chosen = cornerIconCandidates.sortedWith(
                 compareByDescending<CornerIconCandidate> { it.hasPositiveHint }
@@ -436,14 +603,15 @@ class SkipFlowAccessibilityService : AccessibilityService() {
         )
     }
 
-    private fun isCornerIconCandidateClass(node: AccessibilityNodeInfo): Boolean {
+    private fun isCornerIconCandidateClass(node: AccessibilityNodeInfo, isWebViewNode: Boolean): Boolean {
         if (node.isClickable) return true
-        val cls = node.className?.toString()?.lowercase() ?: return false
+        val cls = node.className?.toString()?.lowercase() ?: return isWebViewNode
         return cls.contains("imageview") ||
             cls.contains("imagebutton") ||
             cls.endsWith(".image") ||
             cls.endsWith(".view") ||
-            cls.contains("button")
+            cls.contains("button") ||
+            (isWebViewNode && !cls.contains("webview"))
     }
 
     private fun hasCountdownDescendant(node: AccessibilityNodeInfo): Boolean {
@@ -533,8 +701,9 @@ class SkipFlowAccessibilityService : AccessibilityService() {
         AdTargetType.YOUTUBE_SKIP_AD -> 1
         AdTargetType.GAME_AD_SKIP -> 2
         AdTargetType.GAME_AD_CLOSE -> 3
-        AdTargetType.GAME_AD_ICON -> 4
-        AdTargetType.YOUTUBE_POPUP_DISMISS -> 5
+        AdTargetType.GAME_AD_CONTINUE -> 4
+        AdTargetType.GAME_AD_ICON -> 5
+        AdTargetType.YOUTUBE_POPUP_DISMISS -> 6
     }
 
     private fun executeTargetAction(
@@ -542,9 +711,11 @@ class SkipFlowAccessibilityService : AccessibilityService() {
         stageNumber: Int,
         countAsNewAdSkip: Boolean
     ) {
-        // For YouTube & clickable text controls: climb to clickable parent and try ACTION_CLICK first,
-        // then fall back immediately to dispatchGesture on center coordinates if failed or non-clickable.
-        if (candidate.targetType != AdTargetType.GAME_AD_ICON) {
+        // For YouTube targets: try clickable ancestor ACTION_CLICK first, falling back to dispatchGesture.
+        // For Game/WebView/ImageView targets: execute dispatchGesture directly on center of boundsInScreen.
+        if (candidate.targetType == AdTargetType.YOUTUBE_SKIP_AD ||
+            candidate.targetType == AdTargetType.YOUTUBE_POPUP_DISMISS
+        ) {
             val clickedViaAccessibility = tryClickSelfOrClickableAncestor(candidate.nodeCopy)
             if (clickedViaAccessibility) {
                 onSkipGestureSucceeded(
@@ -556,7 +727,6 @@ class SkipFlowAccessibilityService : AccessibilityService() {
             }
         }
 
-        // Direct center gesture dispatch (for YouTube fallback & all game ad >> / X icons)
         dispatchCenterGesture(
             bounds = candidate.bounds,
             targetType = candidate.targetType,
@@ -686,6 +856,29 @@ class SkipFlowAccessibilityService : AccessibilityService() {
         pendingVolumeRestoreRunnable = null
     }
 
+    private fun registerScreenStateReceiver() {
+        if (isScreenReceiverRegistered) return
+        val filter = IntentFilter().apply {
+            addAction(Intent.ACTION_SCREEN_OFF)
+            addAction(Intent.ACTION_SCREEN_ON)
+            addAction(Intent.ACTION_USER_PRESENT)
+        }
+        runCatching {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                registerReceiver(screenStateReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+            } else {
+                registerReceiver(screenStateReceiver, filter)
+            }
+            isScreenReceiverRegistered = true
+        }
+    }
+
+    private fun unregisterScreenStateReceiver() {
+        if (!isScreenReceiverRegistered) return
+        runCatching { unregisterReceiver(screenStateReceiver) }
+        isScreenReceiverRegistered = false
+    }
+
     @Suppress("DEPRECATION")
     private fun obtainNodeCopy(node: AccessibilityNodeInfo): AccessibilityNodeInfo {
         return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
@@ -705,8 +898,10 @@ class SkipFlowAccessibilityService : AccessibilityService() {
     companion object {
         private const val MAX_SCAN_NODES = 1200
         private const val MAX_SCAN_DEPTH = 40
-        private const val CONTENT_SCAN_THROTTLE_MS = 220L
-        private const val WINDOW_STATE_SCAN_GAP_MS = 80L
+        private const val CONTENT_SCAN_THROTTLE_MS = 200L
+        private const val WINDOW_STATE_SCAN_GAP_MS = 70L
+        private const val COUNTDOWN_POLLING_INTERVAL_MS = 800L
+        private const val POLLING_MIN_SCAN_GAP_MS = 650L
         private const val ADMOB_CONTEXT_WINDOW_MS = 30_000L
         private const val TOAST_COOLDOWN_MS = 2_400L
 

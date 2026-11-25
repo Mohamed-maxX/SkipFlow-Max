@@ -22,25 +22,30 @@ class SafeZoneEvaluatorTest {
     }
 
     @Test
-    fun `allows top 15 percent far-left and far-right textless corner icons between 24dp and 72dp`() {
+    fun `allows top 16 percent left and right 22 percent corner icons between 18dp and 80dp`() {
         // 36dp x 36dp at density 3.0 = 108px x 108px
         val topRightIcon = BoundsRect(940, 80, 1048, 188)
         val topLeftIcon = BoundsRect(32, 80, 140, 188)
+        // Center-ish X=20%..22% boundary (centerX = 230 / 1080 = 21.3%)
+        val innerLeft21Pct = BoundsRect(176, 260, 284, 368)
         val centerTopIcon = BoundsRect(480, 80, 588, 188)
         val lowerIcon = BoundsRect(940, 500, 1048, 608)
 
         assertTrue(SafeZoneEvaluator.isCornerAdIconSize(topRightIcon, screenW, screenH, density))
         assertTrue(SafeZoneEvaluator.isCornerAdIconSize(topLeftIcon, screenW, screenH, density))
+        assertTrue(SafeZoneEvaluator.isCornerAdIconSize(innerLeft21Pct, screenW, screenH, density))
         assertFalse(SafeZoneEvaluator.isCornerAdIconSize(centerTopIcon, screenW, screenH, density))
         assertFalse(SafeZoneEvaluator.isCornerAdIconSize(lowerIcon, screenW, screenH, density))
     }
 
     @Test
-    fun `rejects center and bottom center install CTA banners in game ads`() {
+    fun `allows continue to app button and rejects center or full width install banners`() {
+        val continueBtn = BoundsRect(240, 1950, 840, 2100)
         val centerBanner = BoundsRect(300, 1000, 780, 1200)
         val bottomCenterInstall = BoundsRect(360, 2050, 720, 2200)
         val fullWidthBanner = BoundsRect(20, 80, 1060, 200)
 
+        assertTrue(SafeZoneEvaluator.isWithinSafeZone(continueBtn, screenW, screenH, AdTargetType.GAME_AD_CONTINUE))
         assertFalse(SafeZoneEvaluator.isWithinSafeZone(centerBanner, screenW, screenH, AdTargetType.GAME_AD_CLOSE))
         assertFalse(SafeZoneEvaluator.isWithinSafeZone(bottomCenterInstall, screenW, screenH, AdTargetType.GAME_AD_SKIP))
         assertFalse(SafeZoneEvaluator.isWithinSafeZone(fullWidthBanner, screenW, screenH, AdTargetType.GAME_AD_CLOSE))

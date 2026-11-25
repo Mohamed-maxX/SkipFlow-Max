@@ -3,7 +3,10 @@ package com.max.skipflow.engine
 /**
  * Anti-Misclick Safe Zone validator.
  * - For YouTube Skip Ad buttons: allows anywhere safely visible on screen (including portrait lower-right third).
- * - For Game Ads: validates corner regions & compact dimensions, including top-15% corner icon targets (24dp-72dp).
+ * - For Game Ads:
+ *   - Explicit "Continue to app" / "Close ad" labels allow safe clickable control sizes anywhere visible.
+ *   - Smart Corner Detector (`GAME_AD_ICON`) checks 18dp..80dp controls in top 16% & left/right 22%.
+ *   - Standard Game Ad Skip/Close checks corner regions & compact dimensions.
  */
 object SafeZoneEvaluator {
 
@@ -24,10 +27,12 @@ object SafeZoneEvaluator {
         if (cx < EDGE_MARGIN_PX || cx > screenWidth - EDGE_MARGIN_PX) return false
         if (cy < EDGE_MARGIN_PX || cy > screenHeight - EDGE_MARGIN_PX) return false
 
-        // YouTube Skip Ad button appears in the lower-right third in portrait, bottom-right in landscape, or Shorts overlay.
-        // Remove quadrant restrictions so YouTube Skip Ad is never blocked by SafeZone.
         if (targetType == AdTargetType.YOUTUBE_SKIP_AD) {
             return bounds.width <= screenWidth * 0.85f && bounds.height <= screenHeight * 0.25f
+        }
+
+        if (targetType == AdTargetType.GAME_AD_CONTINUE) {
+            return bounds.width <= screenWidth * 0.85f && bounds.height <= screenHeight * 0.18f
         }
 
         if (targetType == AdTargetType.YOUTUBE_POPUP_DISMISS) {
@@ -44,8 +49,8 @@ object SafeZoneEvaluator {
         val yRatio = cy / screenHeight.toFloat()
 
         if (targetType == AdTargetType.GAME_AD_ICON) {
-            val inTopBand = yRatio <= 0.15f
-            val inFarLeftOrRight = xRatio <= 0.20f || xRatio >= 0.80f
+            val inTopBand = yRatio <= 0.16f
+            val inFarLeftOrRight = xRatio <= 0.22f || xRatio >= 0.78f
             return inTopBand && inFarLeftOrRight
         }
 
@@ -63,8 +68,8 @@ object SafeZoneEvaluator {
         density: Float
     ): Boolean {
         if (density <= 0f || bounds.isEmpty) return false
-        val minPx = (20f * density).toInt()
-        val maxPx = (88f * density).toInt()
+        val minPx = (18f * density).toInt()
+        val maxPx = (80f * density).toInt()
         if (bounds.width !in minPx..maxPx || bounds.height !in minPx..maxPx) return false
         return isWithinSafeZone(bounds, screenWidth, screenHeight, AdTargetType.GAME_AD_ICON)
     }

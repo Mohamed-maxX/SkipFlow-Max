@@ -2,8 +2,8 @@ package com.max.skipflow.engine
 
 /**
  * Dual-recognition rules (text/contentDescription contains matching + SDK View IDs +
- * corner icon heuristics) for YouTube and mobile game ad networks (Pangle, TikTok Ads,
- * AdMob, Unity Ads, AppLovin, IronSource, Vungle, Mintegral).
+ * smart corner icon heuristics) for YouTube and mobile game ad networks (Pangle, TikTok Ads,
+ * AdMob, Unity Ads, AppLovin, IronSource, Vungle, Mintegral/MBridge, InMobi, Chartboost, Fyber, Bigo).
  */
 object AdDetectionRules {
 
@@ -70,39 +70,45 @@ object AdDetectionRules {
         "promo_dismiss_button"
     )
 
-    private val gameAdSkipViewIdSuffixes = setOf(
+    // Substrings checked against full viewIdResourceName (case-insensitive) for game/app ad SDKs
+    private val gameAdSkipViewIdContains = listOf(
+        "tt_top_skip",
+        "tt_video_ad_close",
+        "tt_reward_full_count_down",
         "skip_ad_button",
         "skip_button",
         "btn_skip",
         "ad_skip_button",
         "al_skip_button",
-        "unity_ads_skip_button",
-        "unityads_skip_button",
-        "tt_top_skip",
-        "tt_video_ad_close_layout",
-        "tt_video_ad_close"
+        "unity_ads_skip",
+        "unityads_skip"
     )
 
-    private val gameAdCloseViewIdSuffixes = setOf(
-        "ia_tv_close_button",
-        "ia_close_button",
-        "ad_close_button",
-        "close_ad_button",
-        "close_button",
-        "btn_close",
-        "al_close_button",
-        "applovin_native_ad_close_button",
-        "mrec_close_button",
-        "interstitial_close_button",
-        "interstitial_control_button",
-        "unity_ads_close_button",
-        "unityads_close_button",
-        "vungle_close",
-        "mraid_close_indicator",
+    private val gameAdCloseViewIdContains = listOf(
+        "tt_video_ad_close",
         "tt_close_iv",
         "tt_titlebar_close",
+        "mbridge_windwv_close",
         "mbridge_windvane_close",
-        "mbridge_iv_close"
+        "mbridge_iv_close",
+        "al_close_button",
+        "applovin_native_ad_close_button",
+        "ia_tv_close_button",
+        "ia_close_button",
+        "inter_btn_close",
+        "interstitial_close_button",
+        "interstitial_control_button",
+        "unity_ads_close",
+        "unityads_close",
+        "vungle_close",
+        "mrec_close_button",
+        "mraid_close_indicator",
+        "close_ad_button",
+        "ad_close_button",
+        "ad_close",
+        "close_button",
+        "btn_close",
+        "iv_close"
     )
 
     private val youtubeAdOverlayViewIdSuffixes = setOf(
@@ -119,7 +125,7 @@ object AdDetectionRules {
         "ad_badge"
     )
 
-    // Required YouTube & general skip phrases matched via case-insensitive contains()
+    // YouTube & general skip phrases matched via case-insensitive contains()
     private val skipContainsKeywords = listOf(
         "تخطي الإعلان",
         "تخطي الاعلان",
@@ -129,17 +135,27 @@ object AdDetectionRules {
         "تخطي",
         "skip ads",
         "skip ad",
+        "skip video",
         "skip"
     )
 
-    private val gameCloseKeywords = listOf(
+    // Explicit high-confidence game/app ad close & continue labels (work even outside top corners)
+    private val highConfidenceGameCloseKeywords = listOf(
+        "المتابعة إلى التطبيق",
+        "المتابعة الى التطبيق",
+        "continue to app",
+        "close ad",
         "إغلاق الإعلان",
-        "اغلاق الاعلان",
+        "اغلاق الاعلان"
+    )
+
+    // General game/app ad close labels & icon glyphs (checked in WebView/ImageView/View too)
+    private val gameCloseKeywords = listOf(
         "إغلاق",
         "اغلاق",
-        "close ad",
         "close",
         "dismiss",
+        ">>",
         "×",
         "✕",
         "✖"
@@ -176,30 +192,35 @@ object AdDetectionRules {
         "why this ad"
     )
 
-    private val adActivityKeywords = listOf(
-        "adactivity",
-        "openadsdk",
+    private val adActivitySubstrings = listOf(
+        "interstitial",
+        "reward",
         "pangle",
+        "bytedance",
         "applovin",
         "unity",
-        "ironsource",
         "vungle",
+        "ironsource",
         "mbridge",
         "mintegral",
         "admob",
         "inmobi",
         "chartboost",
         "fyber",
-        "interstitial",
-        "rewarded"
+        "bigo"
     )
 
-    private val gameAdScreenWordRegex = Regex("""(?i)\bad\b""")
+    // Matches "Ad" in CamelCase/package segments (AdActivity, RewardedAdActivity, BannerAd, .ads.) without matching "Loading"
+    private val adActivityCamelOrTokenRegex = Regex("""(?<![a-z])ad(?=[A-Z0-9_.]|$)|(?-i:Ad)(?=[A-Z0-9_.]|$)|(?i)\bads?\b""")
+
+    private val gameAdScreenWordRegex = Regex("""(?i)\b(ad|install|download|open)\b""")
 
     private val gameAdScreenMarkers = listOf(
         "إعلان",
         "اعلان",
         "اعرف المزيد",
+        "تثبيت",
+        "تحميل",
         "learn more",
         "sponsored",
         "ممول",
@@ -237,7 +258,10 @@ object AdDetectionRules {
         "forward",
         "تخطي",
         "إغلاق",
-        ">>"
+        ">>",
+        "×",
+        "✕",
+        "✖"
     )
 
     fun isSystemPackage(packageName: String): Boolean {
@@ -255,8 +279,12 @@ object AdDetectionRules {
 
     fun isAdActivityName(classNameOrPackage: CharSequence?): Boolean {
         if (classNameOrPackage.isNullOrBlank()) return false
-        val lower = classNameOrPackage.toString().lowercase()
-        return adActivityKeywords.any { keyword -> lower.contains(keyword) }
+        val raw = classNameOrPackage.toString()
+        val lower = raw.lowercase()
+        if (adActivitySubstrings.any { keyword -> lower.contains(keyword) }) {
+            return true
+        }
+        return adActivityCamelOrTokenRegex.containsMatchIn(raw)
     }
 
     fun isGameAdTextMarker(
@@ -273,7 +301,8 @@ object AdDetectionRules {
                     idLower.contains(":id/mbridge") ||
                     idLower.contains(":id/vungle") ||
                     idLower.contains("applovin") ||
-                    idLower.contains("openadsdk")
+                    idLower.contains("openadsdk") ||
+                    idLower.contains("bigo")
                 )
         ) {
             return true
@@ -283,8 +312,9 @@ object AdDetectionRules {
 
     private fun containsAdScreenMarker(raw: CharSequence?): Boolean {
         if (raw.isNullOrBlank()) return false
-        val lower = raw.toString().trim().lowercase()
-        if (lower.length > 80) return false
+        val trimmed = raw.toString().trim()
+        if (trimmed.length > 80) return false
+        val lower = trimmed.lowercase()
         if (gameAdScreenMarkers.any { marker -> lower.contains(marker) }) return true
         return gameAdScreenWordRegex.containsMatchIn(lower)
     }
@@ -343,6 +373,7 @@ object AdDetectionRules {
         contentDescription: CharSequence?,
         isClickableOrHasClickableParent: Boolean
     ): AdTargetType? {
+        val idLower = viewIdResourceName?.trim()?.lowercase()
         val idSuffix = extractViewIdSuffix(viewIdResourceName)
         val normText = normalizeText(text)
         val normDesc = normalizeText(contentDescription)
@@ -359,6 +390,7 @@ object AdDetectionRules {
             )
         } else {
             matchGameOrGeneralAdCandidate(
+                idLower = idLower,
                 idSuffix = idSuffix,
                 normText = normText,
                 normDesc = normDesc,
@@ -396,35 +428,43 @@ object AdDetectionRules {
     }
 
     private fun matchGameOrGeneralAdCandidate(
+        idLower: String?,
         idSuffix: String?,
         normText: String?,
         normDesc: String?,
         isClickable: Boolean
     ): AdTargetType? {
-        if (idSuffix != null) {
-            if (idSuffix in gameAdSkipViewIdSuffixes ||
-                (idSuffix.startsWith("tt_") && idSuffix.contains("skip"))
-            ) {
+        // Avoid matching sound/mute/info/feedback controls even if they share generic suffixes
+        if (hasExcludedAudioOrInfoKeyword(idLower, normText, normDesc)) {
+            return null
+        }
+
+        if (idLower != null) {
+            if (gameAdSkipViewIdContains.any { idLower.contains(it) }) {
                 return AdTargetType.GAME_AD_SKIP
             }
-            if (idSuffix in gameAdCloseViewIdSuffixes ||
-                (idSuffix.startsWith("al_") && (idSuffix.contains("close") || idSuffix.contains("skip"))) ||
-                (idSuffix.startsWith("unity") && (idSuffix.contains("close") || idSuffix.contains("skip"))) ||
-                (idSuffix.startsWith("tt_") && idSuffix.contains("close")) ||
-                (idSuffix.startsWith("mbridge_") && idSuffix.contains("close"))
+            if (gameAdCloseViewIdContains.any { idLower.contains(it) } ||
+                (idSuffix != null && (
+                    (idSuffix.startsWith("al_") && (idSuffix.contains("close") || idSuffix.contains("skip"))) ||
+                        (idSuffix.startsWith("unity") && (idSuffix.contains("close") || idSuffix.contains("skip"))) ||
+                        (idSuffix.startsWith("tt_") && idSuffix.contains("close")) ||
+                        (idSuffix.startsWith("mbridge_") && idSuffix.contains("close"))
+                    ))
             ) {
-                return if (idSuffix.contains("skip")) AdTargetType.GAME_AD_SKIP else AdTargetType.GAME_AD_CLOSE
+                return if (idLower.contains("skip")) AdTargetType.GAME_AD_SKIP else AdTargetType.GAME_AD_CLOSE
             }
+        }
+
+        // High-confidence "Continue to app" / "Skip Ad" / "Close Ad" work across WebView/ImageView regardless of isClickable
+        if (matchesHighConfidenceClose(normText) || matchesHighConfidenceClose(normDesc)) {
+            return AdTargetType.GAME_AD_CONTINUE
         }
 
         if (matchesSkipContains(normText) || matchesSkipContains(normDesc)) {
             return AdTargetType.GAME_AD_SKIP
         }
 
-        if (!isClickable) {
-            return null
-        }
-
+        // Do NOT require isClickable == true for WebView/ImageView game close controls
         if (matchesGameCloseContains(normText) || matchesGameCloseContains(normDesc)) {
             return AdTargetType.GAME_AD_CLOSE
         }
@@ -432,7 +472,7 @@ object AdDetectionRules {
         return null
     }
 
-    fun isExcludedCornerIcon(
+    fun hasExcludedAudioOrInfoKeyword(
         viewIdResourceName: String?,
         text: CharSequence?,
         contentDescription: CharSequence?
@@ -442,15 +482,21 @@ object AdDetectionRules {
             text?.toString()?.lowercase(),
             contentDescription?.toString()?.lowercase()
         ).joinToString(" ")
+        return combined.isNotEmpty() && excludedCornerIconKeywords.any { combined.contains(it) }
+    }
 
-        if (combined.isNotEmpty() && excludedCornerIconKeywords.any { combined.contains(it) }) {
+    fun isExcludedCornerIcon(
+        viewIdResourceName: String?,
+        text: CharSequence?,
+        contentDescription: CharSequence?
+    ): Boolean {
+        if (hasExcludedAudioOrInfoKeyword(viewIdResourceName, text, contentDescription)) {
             return true
         }
 
         val normText = normalizeText(text, maxLength = 32)
         if (normText != null) {
             if (isCountdownText(normText)) return true
-            // Avoid mistapping long corner labels that are not close/skip symbols
             val isExplicitPositive = positiveCornerIconKeywords.any { normText.contains(it) } ||
                 normText in setOf("x", "×", "✕", "✖", ">", ">>")
             if (normText.length > 4 && !isExplicitPositive) {
@@ -476,6 +522,11 @@ object AdDetectionRules {
     private fun matchesSkipContains(normalized: String?): Boolean {
         if (normalized == null) return false
         return skipContainsKeywords.any { keyword -> normalized.contains(keyword, ignoreCase = true) }
+    }
+
+    private fun matchesHighConfidenceClose(normalized: String?): Boolean {
+        if (normalized == null) return false
+        return highConfidenceGameCloseKeywords.any { keyword -> normalized.contains(keyword, ignoreCase = true) }
     }
 
     private fun matchesGameCloseContains(normalized: String?): Boolean {

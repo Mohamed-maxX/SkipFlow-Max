@@ -27,7 +27,7 @@ class HumanTouchGeneratorTest {
     }
 
     @Test
-    fun `multi-stage state machine enforces 1500ms cooldown and handles second stage icon`() {
+    fun `multi-stage state machine enforces 1800ms cooldown and handles second stage icon`() {
         val machine = MultiStageAdStateMachine()
         val stage1Bounds = BoundsRect(950, 80, 1040, 170)
         val stage2Bounds = BoundsRect(40, 80, 130, 170)
@@ -35,12 +35,12 @@ class HumanTouchGeneratorTest {
         val d1 = machine.evaluateCandidate("com.game.one", stage1Bounds, AdTargetType.GAME_AD_ICON, 1000L)
         assertEquals(StageDecision.ExecuteTap(stageNumber = 1, countAsNewAdSkip = true), d1)
 
-        // Rapid event within 1500ms cooldown must be ignored
-        val cooldownIgnored = machine.evaluateCandidate("com.game.one", stage2Bounds, AdTargetType.GAME_AD_ICON, 2000L)
+        // Rapid event within 1800ms cooldown must be ignored
+        val cooldownIgnored = machine.evaluateCandidate("com.game.one", stage2Bounds, AdTargetType.GAME_AD_ICON, 2500L)
         assertTrue(cooldownIgnored is StageDecision.Ignore)
 
-        // After 1500ms cooldown, second stage end-card X executes without double counting
-        val d2 = machine.evaluateCandidate("com.game.one", stage2Bounds, AdTargetType.GAME_AD_CLOSE, 2600L)
+        // After 1800ms cooldown, second stage end-card X executes without double counting
+        val d2 = machine.evaluateCandidate("com.game.one", stage2Bounds, AdTargetType.GAME_AD_CLOSE, 2900L)
         assertEquals(StageDecision.ExecuteTap(stageNumber = 2, countAsNewAdSkip = false), d2)
 
         // New ad much later resets session

@@ -13,7 +13,7 @@ sealed interface StageDecision {
 
 /**
  * Handles multi-stage game ads (e.g. initial close/skip >> or X followed by a second end-card X)
- * while enforcing a 1500ms cooldown to prevent repeated clicks and avoid double-counting stats.
+ * while enforcing an 1800ms cooldown to prevent repeated clicks and avoid double-counting stats.
  */
 class MultiStageAdStateMachine {
 
@@ -39,7 +39,7 @@ class MultiStageAdStateMachine {
 
         val elapsedSinceLastTap = nowMs - lastTapAtMs
         if (lastTapAtMs > 0L && elapsedSinceLastTap in 0 until TAP_COOLDOWN_MS) {
-            return StageDecision.Ignore("tap_cooldown_1500ms")
+            return StageDecision.Ignore("tap_cooldown_1800ms")
         }
 
         val isSameSession = activePackage == packageName &&
@@ -85,9 +85,9 @@ class MultiStageAdStateMachine {
     }
 
     companion object {
-        const val TAP_COOLDOWN_MS = 1500L
-        const val SAME_SPOT_SETTLE_MS = 1800L
-        const val MULTI_STAGE_WINDOW_MS = 8000L
+        const val TAP_COOLDOWN_MS = 1800L
+        const val SAME_SPOT_SETTLE_MS = 2000L
+        const val MULTI_STAGE_WINDOW_MS = 8500L
         const val POPUP_COOLDOWN_MS = 2500L
         const val SAME_SPOT_TOLERANCE_PX = 20
         const val MAX_STAGES_PER_AD = 3

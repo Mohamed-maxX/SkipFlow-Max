@@ -22,5 +22,6 @@ enum class AdTargetType(val estimatedSavedSeconds: Long) {
     YOUTUBE_POPUP_DISMISS(4L),
     GAME_AD_SKIP(20L),
     GAME_AD_CLOSE(20L),
+    GAME_AD_CONTINUE(20L),
     GAME_AD_ICON(20L)
 }
