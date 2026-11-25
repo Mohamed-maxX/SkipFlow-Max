@@ -68,7 +68,15 @@ class RepositoryAndVolumeTest {
         assertTrue(repo.isPackageEnabled(AdDetectionRules.YOUTUBE_PACKAGE))
         assertTrue(repo.isPackageEnabled("com.example.newgame"))
         assertFalse(repo.isPackageEnabled("com.android.systemui"))
+        assertFalse(repo.isPackageEnabled(AdDetectionRules.PLAY_STORE_PACKAGE))
+        assertFalse(repo.isPackageEnabled("com.android.chrome"))
+        assertFalse(repo.isPackageEnabled("com.whatsapp"))
+        assertFalse(repo.isPackageEnabled(AdDetectionRules.GMS_PACKAGE))
         assertFalse(repo.isPackageEnabled(AdDetectionRules.SELF_PACKAGE))
+
+        assertTrue(repo.settings.value.bounceBackFromPlayStore)
+        repo.setBounceBackFromPlayStore(false)
+        assertFalse(repo.settings.value.bounceBackFromPlayStore)
 
         // User can disable a specific app from App Manager
         repo.setPackageEnabled("com.example.newgame", false)

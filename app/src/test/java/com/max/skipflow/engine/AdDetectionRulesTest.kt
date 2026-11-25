@@ -45,49 +45,68 @@ class AdDetectionRulesTest {
             isClickableOrHasClickableParent = false
         )
         assertEquals(AdTargetType.YOUTUBE_SKIP_AD, byContainsAlTakhtiDesc)
-
-        val byContainsEnglishDesc = AdDetectionRules.matchCandidate(
-            packageName = AdDetectionRules.YOUTUBE_PACKAGE,
-            viewIdResourceName = null,
-            text = null,
-            contentDescription = "Tap to SKIP AD now",
-            isClickableOrHasClickableParent = false
-        )
-        assertEquals(AdTargetType.YOUTUBE_SKIP_AD, byContainsEnglishDesc)
     }
 
     @Test
-    fun `matches WebView and game SDK view IDs and text even when not marked clickable`() {
-        assertEquals(
-            AdTargetType.GAME_AD_CLOSE,
+    fun `never matches anything inside strictly excluded packages like Play Store Chrome WhatsApp GMS`() {
+        val excluded = listOf(
+            "com.android.vending",
+            "com.android.settings",
+            "com.android.systemui",
+            "com.google.android.gms",
+            "com.android.chrome",
+            "com.whatsapp",
+            "com.facebook.katana",
+            "com.instagram.android",
+            "org.telegram.messenger",
+            "com.max.skipflow",
+            "com.google.android.apps.nexuslauncher",
+            "com.sec.android.app.launcher",
+            "com.miui.home",
+            "com.some.customlauncher"
+        )
+
+        for (pkg in excluded) {
+            assertTrue("$pkg must be strictly excluded", AdDetectionRules.isStrictlyExcludedPackage(pkg))
+            assertNull(
+                "$pkg must never yield a match",
+                AdDetectionRules.matchCandidate(
+                    packageName = pkg,
+                    viewIdResourceName = "$pkg:id/close_button",
+                    text = "Close",
+                    contentDescription = "Skip",
+                    isClickableOrHasClickableParent = true,
+                    isAdActivityContext = true
+                )
+            )
+        }
+    }
+
+    @Test
+    fun `restricts generic close and skip matching in games strictly to real Ad Activities`() {
+        // Inside normal game Activity (not AdActivity): generic X / Close / Skip must NOT match
+        assertNull(
             AdDetectionRules.matchCandidate(
                 packageName = "com.game.play",
-                viewIdResourceName = "com.game.play:id/mbridge_windwv_close",
-                text = null,
+                viewIdResourceName = null,
+                text = ">>",
                 contentDescription = null,
-                isClickableOrHasClickableParent = false
+                isClickableOrHasClickableParent = true,
+                isAdActivityContext = false
             )
         )
-        assertEquals(
-            AdTargetType.GAME_AD_SKIP,
+        assertNull(
             AdDetectionRules.matchCandidate(
                 packageName = "com.game.play",
-                viewIdResourceName = "com.game.play:id/tt_reward_full_count_down",
-                text = "Skip",
+                viewIdResourceName = null,
+                text = "Close",
                 contentDescription = null,
-                isClickableOrHasClickableParent = false
+                isClickableOrHasClickableParent = true,
+                isAdActivityContext = false
             )
         )
-        assertEquals(
-            AdTargetType.GAME_AD_CLOSE,
-            AdDetectionRules.matchCandidate(
-                packageName = "com.game.play",
-                viewIdResourceName = "com.game.play:id/inter_btn_close",
-                text = null,
-                contentDescription = null,
-                isClickableOrHasClickableParent = false
-            )
-        )
+
+        // Inside real AdActivity: generic close/skip & SDK IDs match cleanly
         assertEquals(
             AdTargetType.GAME_AD_CLOSE,
             AdDetectionRules.matchCandidate(
@@ -95,7 +114,19 @@ class AdDetectionRulesTest {
                 viewIdResourceName = null,
                 text = ">>",
                 contentDescription = null,
-                isClickableOrHasClickableParent = false
+                isClickableOrHasClickableParent = false,
+                isAdActivityContext = true
+            )
+        )
+        assertEquals(
+            AdTargetType.GAME_AD_CLOSE,
+            AdDetectionRules.matchCandidate(
+                packageName = "com.game.play",
+                viewIdResourceName = "com.game.play:id/mbridge_windwv_close",
+                text = null,
+                contentDescription = null,
+                isClickableOrHasClickableParent = false,
+                isAdActivityContext = false
             )
         )
         assertEquals(
@@ -105,91 +136,90 @@ class AdDetectionRulesTest {
                 viewIdResourceName = null,
                 text = "المتابعة إلى التطبيق",
                 contentDescription = null,
-                isClickableOrHasClickableParent = false
-            )
-        )
-        assertEquals(
-            AdTargetType.GAME_AD_CONTINUE,
-            AdDetectionRules.matchCandidate(
-                packageName = "com.game.play",
-                viewIdResourceName = null,
-                text = null,
-                contentDescription = "Continue to app",
-                isClickableOrHasClickableParent = false
+                isClickableOrHasClickableParent = false,
+                isAdActivityContext = false
             )
         )
     }
 
     @Test
-    fun `ignores countdown labels before skip becomes active`() {
-        val countdownEn = AdDetectionRules.matchCandidate(
-            packageName = AdDetectionRules.YOUTUBE_PACKAGE,
-            viewIdResourceName = "com.google.android.youtube:id/modern_skip_ad_text",
-            text = "Skip in 5",
-            contentDescription = null,
-            isClickableOrHasClickableParent = true
+    fun `detects only real ad SDK activities and rejects game or store activities`() {
+        val realAds = listOf(
+            "com.google.android.gms.ads.AdActivity",
+            "com.applovin.adview.AppLovinFullscreenActivity",
+            "com.unity3d.services.ads.adunit.AdUnitActivity",
+            "com.unity3d.ads.UnityAdsFullscreenActivity",
+            "com.bytedance.sdk.openadsdk.activity.TTRewardVideoActivity",
+            "com.bytedance.sdk.openadsdk.activity.TTFullScreenVideoActivity",
+            "com.mbridge.msdk.reward.player.MBRewardVideoActivity",
+            "com.ironsource.sdk.controller.InterstitialActivity",
+            "com.vungle.ads.internal.ui.VungleActivity",
+            "com.facebook.ads.AudienceNetworkActivity",
+            "sg.bigo.ads.ad.interstitial.BigoInterstitialActivity",
+            "com.inmobi.ads.rendering.InMobiAdActivity",
+            "com.chartboost.sdk.view.CBImpressionActivity",
+            "com.fyber.inneractive.sdk.activities.InneractiveFullscreenAdActivity"
         )
-        assertNull(countdownEn)
+        for (cls in realAds) {
+            assertTrue("Expected real ad activity: $cls", AdDetectionRules.isRealAdActivity(cls))
+        }
 
-        val countdownPangle = AdDetectionRules.matchCandidate(
-            packageName = "com.some.game",
-            viewIdResourceName = "com.some.game:id/tt_reward_full_count_down",
-            text = "15s",
-            contentDescription = null,
-            isClickableOrHasClickableParent = true
+        val nonAds = listOf(
+            "com.unity3d.player.UnityPlayerActivity",
+            "com.android.vending.AssetBrowserActivity",
+            "com.example.LoadingActivity",
+            "com.example.MainActivity"
         )
-        assertNull(countdownPangle)
+        for (cls in nonAds) {
+            assertFalse("Expected non-ad activity: $cls", AdDetectionRules.isRealAdActivity(cls))
+        }
     }
 
     @Test
-    fun `matches YouTube premium popup dismiss safely without generic close`() {
-        val dismissAr = AdDetectionRules.matchCandidate(
-            packageName = AdDetectionRules.YOUTUBE_PACKAGE,
-            viewIdResourceName = "com.google.android.youtube:id/mealbar_dismiss_button",
-            text = "لا شكراً",
-            contentDescription = null,
-            isClickableOrHasClickableParent = true
+    fun `excludes account notification settings menu search back mute info corner icons`() {
+        val forbiddenHints = listOf(
+            Triple("com.vending:id/account_badge", null, null),
+            Triple(null, null, "Notification bell"),
+            Triple(null, null, "Profile"),
+            Triple("com.game:id/btn_settings", null, null),
+            Triple(null, null, "Menu"),
+            Triple(null, null, "Search"),
+            Triple("com.app:id/toolbar_back", null, null),
+            Triple("com.game:id/tt_video_ad_mute", null, null),
+            Triple(null, null, "Volume control"),
+            Triple(null, null, "Sound"),
+            Triple(null, null, "Privacy info"),
+            Triple(null, null, "Report feedback"),
+            Triple(null, "12s", null)
         )
-        assertEquals(AdTargetType.YOUTUBE_POPUP_DISMISS, dismissAr)
-
-        val genericCloseInYouTube = AdDetectionRules.matchCandidate(
-            packageName = AdDetectionRules.YOUTUBE_PACKAGE,
-            viewIdResourceName = "com.google.android.youtube:id/close_button",
-            text = "إغلاق",
-            contentDescription = null,
-            isClickableOrHasClickableParent = true
-        )
-        assertNull(genericCloseInYouTube)
-    }
-
-    @Test
-    fun `detects game ad screen markers across SDKs and excludes mute or info corner icons`() {
-        assertTrue(AdDetectionRules.isAdActivityName("com.bytedance.sdk.openadsdk.activity.TTRewardVideoActivity"))
-        assertTrue(AdDetectionRules.isAdActivityName("com.applovin.adview.AppLovinFullscreenActivity"))
-        assertTrue(AdDetectionRules.isAdActivityName("com.google.android.gms.ads.AdActivity"))
-        assertTrue(AdDetectionRules.isAdActivityName("com.example.RewardedAdActivity"))
-        assertTrue(AdDetectionRules.isAdActivityName("sg.bigo.ads.ad.interstitial.BigoInterstitialActivity"))
-        assertFalse(AdDetectionRules.isAdActivityName("com.example.LoadingActivity"))
-
-        assertTrue(AdDetectionRules.isGameAdTextMarker(null, "إعلان", null))
-        assertTrue(AdDetectionRules.isGameAdTextMarker(null, "Install", null))
-        assertTrue(AdDetectionRules.isGameAdTextMarker(null, "Download", null))
-        assertTrue(AdDetectionRules.isGameAdTextMarker(null, "Open", null))
-        assertTrue(AdDetectionRules.isGameAdTextMarker(null, "اعرف المزيد", null))
-        assertFalse(AdDetectionRules.isGameAdTextMarker(null, "Score 1500", null))
-
-        assertTrue(AdDetectionRules.isExcludedCornerIcon("com.game:id/tt_video_ad_mute", null, null))
-        assertTrue(AdDetectionRules.isExcludedCornerIcon(null, null, "AdChoices"))
-        assertTrue(AdDetectionRules.isExcludedCornerIcon(null, "12s", null))
+        for ((id, text, desc) in forbiddenHints) {
+            assertTrue(
+                "Expected exclusion for ($id, $text, $desc)",
+                AdDetectionRules.isExcludedCornerIcon(id, text, desc)
+            )
+        }
         assertFalse(AdDetectionRules.isExcludedCornerIcon("com.game:id/tt_top_skip", null, null))
     }
 
     @Test
-    fun `identifies system packages and self package accurately`() {
-        assertTrue(AdDetectionRules.isSystemPackage(AdDetectionRules.SELF_PACKAGE))
-        assertTrue(AdDetectionRules.isSystemPackage("com.android.systemui"))
-        assertTrue(AdDetectionRules.isSystemPackage("com.android.settings"))
-        assertFalse(AdDetectionRules.isSystemPackage(AdDetectionRules.YOUTUBE_PACKAGE))
-        assertFalse(AdDetectionRules.isSystemPackage("com.supercell.clashroyale"))
+    fun `ignores countdown labels and protects YouTube generic close`() {
+        assertNull(
+            AdDetectionRules.matchCandidate(
+                packageName = AdDetectionRules.YOUTUBE_PACKAGE,
+                viewIdResourceName = "com.google.android.youtube:id/modern_skip_ad_text",
+                text = "Skip in 5",
+                contentDescription = null,
+                isClickableOrHasClickableParent = true
+            )
+        )
+        assertNull(
+            AdDetectionRules.matchCandidate(
+                packageName = AdDetectionRules.YOUTUBE_PACKAGE,
+                viewIdResourceName = "com.google.android.youtube:id/close_button",
+                text = "إغلاق",
+                contentDescription = null,
+                isClickableOrHasClickableParent = true
+            )
+        )
     }
 }

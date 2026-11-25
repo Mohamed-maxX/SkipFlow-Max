@@ -44,7 +44,7 @@ class AppCatalogRepository(private val context: Context) {
         for (resolveInfo in resolved) {
             val appInfo = resolveInfo.activityInfo?.applicationInfo ?: continue
             val pkg = appInfo.packageName ?: continue
-            if (pkg == selfPkg || AdDetectionRules.isSystemPackage(pkg)) continue
+            if (pkg == selfPkg || AdDetectionRules.isStrictlyExcludedPackage(pkg)) continue
             if (appsByPkg.containsKey(pkg)) continue
 
             val label = resolveInfo.loadLabel(pm)?.toString()?.trim()

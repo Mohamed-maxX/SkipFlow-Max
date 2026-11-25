@@ -88,7 +88,8 @@ class SkipFlowRepository(
             autoMuteYouTubeAds = storage.getBoolean(KEY_AUTO_MUTE_YT, true),
             vibrateOnSkip = storage.getBoolean(KEY_VIBRATE_ON_SKIP, true),
             toastOnSkip = storage.getBoolean(KEY_TOAST_ON_SKIP, true),
-            pauseDuringCalls = storage.getBoolean(KEY_PAUSE_DURING_CALLS, true)
+            pauseDuringCalls = storage.getBoolean(KEY_PAUSE_DURING_CALLS, true),
+            bounceBackFromPlayStore = storage.getBoolean(KEY_BOUNCE_BACK_PLAY_STORE, true)
         )
     }
 
@@ -154,6 +155,13 @@ class SkipFlowRepository(
         }
     }
 
+    fun setBounceBackFromPlayStore(enabled: Boolean) {
+        synchronized(lock) {
+            storage.putBoolean(KEY_BOUNCE_BACK_PLAY_STORE, enabled)
+            _settings.value = _settings.value.copy(bounceBackFromPlayStore = enabled)
+        }
+    }
+
     fun setPackageEnabled(packageName: String, enabled: Boolean) {
         synchronized(lock) {
             val updated = _disabledPackages.value.toMutableSet()
@@ -168,7 +176,9 @@ class SkipFlowRepository(
     }
 
     fun isPackageEnabled(packageName: String): Boolean {
-        if (AdDetectionRules.isSystemPackage(packageName) || AdDetectionRules.isInputMethodPackage(packageName)) {
+        if (AdDetectionRules.isStrictlyExcludedPackage(packageName) ||
+            AdDetectionRules.isInputMethodPackage(packageName)
+        ) {
             return false
         }
         return packageName !in _disabledPackages.value
@@ -213,6 +223,7 @@ class SkipFlowRepository(
         private const val KEY_VIBRATE_ON_SKIP = "vibrate_on_skip"
         private const val KEY_TOAST_ON_SKIP = "toast_on_skip"
         private const val KEY_PAUSE_DURING_CALLS = "pause_during_calls"
+        private const val KEY_BOUNCE_BACK_PLAY_STORE = "bounce_back_play_store"
         private const val KEY_BLACKLIST_INITIALIZED = "blacklist_mode_initialized"
         private const val KEY_DISABLED_PACKAGES = "disabled_packages"
         private const val KEY_STATS_DATE = "stats_date"

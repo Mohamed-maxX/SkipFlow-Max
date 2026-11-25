@@ -48,14 +48,13 @@ class SkipFlowAccessibilityService : AccessibilityService() {
     private val mainHandler = Handler(Looper.getMainLooper())
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private val multiStageStateMachine = MultiStageAdStateMachine()
+    private val playStoreRedirectGuard = PlayStoreRedirectGuard()
 
     private var pollingJob: Job? = null
     private var activeMonitoredPackage: String? = null
+    private var currentActivityPackage: String? = null
+    private var currentActivityClassName: String? = null
     private var lastScanElapsedMs: Long = 0L
-    private var lastEnabledGamePackage: String? = null
-    private var lastEnabledGameActiveAtMs: Long = 0L
-    private var lastWindowPackage: String? = null
-    private var lastWindowClassName: String? = null
     private var lastToastShownAtMs: Long = 0L
     private var pendingVolumeRestoreRunnable: Runnable? = null
     private var isScreenReceiverRegistered: Boolean = false
@@ -99,33 +98,40 @@ class SkipFlowAccessibilityService : AccessibilityService() {
         }
 
         val eventPkg = event?.packageName?.toString() ?: return
-        if (eventPkg == packageName || AdDetectionRules.isInputMethodPackage(eventPkg)) {
+        if (AdDetectionRules.isInputMethodPackage(eventPkg)) {
             return
         }
 
         val nowElapsed = SystemClock.elapsedRealtime()
         val isWindowChange = event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED
+
         if (isWindowChange) {
-            val eventClass = event.className?.toString()
-            if (!eventClass.isNullOrBlank()) {
-                lastWindowPackage = eventPkg
-                lastWindowClassName = eventClass
-            } else if (lastWindowPackage != eventPkg) {
-                lastWindowPackage = eventPkg
-                lastWindowClassName = null
+            updateCurrentActivityTracking(eventPkg, event.className)
+
+            // Anti-Redirect Bounce-Back: return user once if an ad click redirected straight to Play Store
+            if (playStoreRedirectGuard.shouldBounceBack(
+                    enteredPackage = eventPkg,
+                    bounceBackEnabled = currentSettings.bounceBackFromPlayStore,
+                    nowMs = nowElapsed
+                )
+            ) {
+                stopCountdownPolling()
+                activeMonitoredPackage = null
+                _currentActivePackage.value = null
+                performGlobalAction(GLOBAL_ACTION_BACK)
+                if (currentSettings.toastOnSkip) {
+                    showDebouncedToast("تم الرجوع تلقائياً من المتجر", nowElapsed)
+                }
+                return
+            }
+
+            if (AdDetectionRules.isLauncherPackage(eventPkg)) {
+                playStoreRedirectGuard.clearOnLauncherOrUserExit()
             }
         }
 
-        val disabledPackages = repository.disabledPackages.value
-
-        // Context-Aware O(1) idle check: zero tree traversal or polling for system or disabled apps
-        val monitoredPackage = resolveMonitoredPackage(
-            eventPkg = eventPkg,
-            eventClassName = event.className,
-            disabledPackages = disabledPackages,
-            nowElapsed = nowElapsed
-        )
-        if (monitoredPackage == null) {
+        // Strict Exclusion List: never scan or click inside Play Store, GMS, Chrome, Social apps, System, Launchers, or SkipFlow Max
+        if (eventPkg == packageName || AdDetectionRules.isStrictlyExcludedPackage(eventPkg)) {
             activeMonitoredPackage = null
             _currentActivePackage.value = null
             stopCountdownPolling()
@@ -135,8 +141,19 @@ class SkipFlowAccessibilityService : AccessibilityService() {
             return
         }
 
-        activeMonitoredPackage = monitoredPackage
-        _currentActivePackage.value = monitoredPackage
+        val disabledPackages = repository.disabledPackages.value
+        if (eventPkg in disabledPackages) {
+            activeMonitoredPackage = null
+            _currentActivePackage.value = null
+            stopCountdownPolling()
+            if (eventPkg != AdDetectionRules.YOUTUBE_PACKAGE) {
+                volumeController.forceRestore()
+            }
+            return
+        }
+
+        activeMonitoredPackage = eventPkg
+        _currentActivePackage.value = eventPkg
 
         // Pause automatically during phone/VoIP calls
         if (currentSettings.pauseDuringCalls && CallStateMonitor.isCallActive(audioManager)) {
@@ -145,7 +162,7 @@ class SkipFlowAccessibilityService : AccessibilityService() {
             return
         }
 
-        // Start lightweight 800ms countdown polling while an enabled app/game is foregrounded
+        // Start lightweight 800ms polling while inside an active monitored app/game
         ensureCountdownPollingActive()
 
         val minInterval = if (isWindowChange) WINDOW_STATE_SCAN_GAP_MS else CONTENT_SCAN_THROTTLE_MS
@@ -154,8 +171,7 @@ class SkipFlowAccessibilityService : AccessibilityService() {
         }
 
         performMultiWindowScan(
-            monitoredPackage = monitoredPackage,
-            eventClassName = event.className,
+            monitoredPackage = eventPkg,
             nowElapsed = nowElapsed
         )
     }
@@ -189,6 +205,33 @@ class SkipFlowAccessibilityService : AccessibilityService() {
         super.onDestroy()
     }
 
+    private fun updateCurrentActivityTracking(eventPkg: String, rawClassName: CharSequence?) {
+        val cls = rawClassName?.toString()?.trim()
+        if (eventPkg != currentActivityPackage) {
+            currentActivityPackage = eventPkg
+            currentActivityClassName = cls
+            return
+        }
+        if (cls.isNullOrBlank()) return
+
+        // Avoid replacing a real AdActivity name with transient Dialog/Widget classes inside the same package
+        val isGenericUiComponent = cls.startsWith("android.widget.") ||
+            cls.startsWith("android.view.") ||
+            cls == "android.app.Dialog" ||
+            cls.contains("PopupWindow") ||
+            cls.contains("AlertDialog")
+        if (!isGenericUiComponent || AdDetectionRules.isRealAdActivity(cls)) {
+            currentActivityClassName = cls
+        }
+    }
+
+    private fun isCurrentActivityRealAdScreen(packageName: String): Boolean {
+        if (packageName == AdDetectionRules.YOUTUBE_PACKAGE) return false
+        if (AdDetectionRules.isStrictlyExcludedPackage(packageName)) return false
+        if (currentActivityPackage != packageName) return false
+        return AdDetectionRules.isRealAdActivity(currentActivityClassName)
+    }
+
     private fun ensureCountdownPollingActive() {
         if (!powerManager.isInteractive) {
             stopCountdownPolling()
@@ -209,7 +252,7 @@ class SkipFlowAccessibilityService : AccessibilityService() {
                 }
 
                 val nowElapsed = SystemClock.elapsedRealtime()
-                val liveMonitoredPkg = resolveForegroundMonitoredPackage(nowElapsed)
+                val liveMonitoredPkg = resolveForegroundMonitoredPackage()
                 if (liveMonitoredPkg == null) {
                     activeMonitoredPackage = null
                     _currentActivePackage.value = null
@@ -224,7 +267,6 @@ class SkipFlowAccessibilityService : AccessibilityService() {
                 if (nowElapsed - lastScanElapsedMs >= POLLING_MIN_SCAN_GAP_MS) {
                     performMultiWindowScan(
                         monitoredPackage = liveMonitoredPkg,
-                        eventClassName = null,
                         nowElapsed = nowElapsed
                     )
                 }
@@ -237,7 +279,7 @@ class SkipFlowAccessibilityService : AccessibilityService() {
         pollingJob = null
     }
 
-    private fun resolveForegroundMonitoredPackage(nowElapsed: Long): String? {
+    private fun resolveForegroundMonitoredPackage(): String? {
         val disabledPackages = repository.disabledPackages.value
         val activeRoot = rootInActiveWindow
         val activePkg = try {
@@ -247,29 +289,30 @@ class SkipFlowAccessibilityService : AccessibilityService() {
         }
 
         if (!activePkg.isNullOrBlank()) {
-            if (activePkg == packageName || AdDetectionRules.isSystemPackage(activePkg) || activePkg in disabledPackages) {
+            if (activePkg == packageName ||
+                AdDetectionRules.isStrictlyExcludedPackage(activePkg) ||
+                activePkg in disabledPackages
+            ) {
                 return null
             }
             if (!AdDetectionRules.isInputMethodPackage(activePkg)) {
-                return resolveMonitoredPackage(
-                    eventPkg = activePkg,
-                    eventClassName = null,
-                    disabledPackages = disabledPackages,
-                    nowElapsed = nowElapsed
-                )
+                return activePkg
             }
         }
 
         return activeMonitoredPackage?.takeIf {
-            it != packageName && !AdDetectionRules.isSystemPackage(it) && it !in disabledPackages
+            it != packageName &&
+                !AdDetectionRules.isStrictlyExcludedPackage(it) &&
+                it !in disabledPackages
         }
     }
 
     private fun performMultiWindowScan(
         monitoredPackage: String,
-        eventClassName: CharSequence?,
         nowElapsed: Long
     ) {
+        if (AdDetectionRules.isStrictlyExcludedPackage(monitoredPackage)) return
+
         lastScanElapsedMs = nowElapsed
         val currentSettings = repository.settings.value
         val candidateWindows = collectAllApplicationWindowRoots(
@@ -282,23 +325,16 @@ class SkipFlowAccessibilityService : AccessibilityService() {
         var bestCandidate: CandidateMatch? = null
 
         try {
-            val adActivityContext = AdDetectionRules.isAdActivityName(eventClassName) ||
-                (lastWindowPackage == monitoredPackage && AdDetectionRules.isAdActivityName(lastWindowClassName)) ||
-                monitoredPackage == AdDetectionRules.ADMOB_AD_ACTIVITY_PACKAGE
+            val realAdActivityActive = isCurrentActivityRealAdScreen(monitoredPackage)
 
             for (root in candidateWindows) {
-                val rootPkg = root.packageName?.toString()
-                val windowPackage = when {
-                    rootPkg.isNullOrBlank() -> monitoredPackage
-                    rootPkg == AdDetectionRules.ADMOB_AD_ACTIVITY_PACKAGE -> monitoredPackage
-                    else -> rootPkg
-                }
+                val rootPkg = root.packageName?.toString() ?: monitoredPackage
+                if (AdDetectionRules.isStrictlyExcludedPackage(rootPkg)) continue
+
                 val result = scanWindowTree(
                     root = root,
-                    monitoredPackage = windowPackage,
-                    initialAdActivityHint = adActivityContext ||
-                        AdDetectionRules.isAdActivityName(root.className) ||
-                        AdDetectionRules.isAdActivityName(rootPkg)
+                    monitoredPackage = rootPkg,
+                    isRealAdActivity = realAdActivityActive || isCurrentActivityRealAdScreen(rootPkg)
                 )
                 if (result.hasYouTubeAdIndicator) {
                     hasYouTubeAd = true
@@ -330,6 +366,7 @@ class SkipFlowAccessibilityService : AccessibilityService() {
             )
 
             if (decision is StageDecision.ExecuteTap) {
+                playStoreRedirectGuard.recordGameOrAdSkipAttempt(monitoredPackage, nowElapsed)
                 executeTargetAction(
                     candidate = winner,
                     stageNumber = decision.stageNumber,
@@ -342,45 +379,9 @@ class SkipFlowAccessibilityService : AccessibilityService() {
         }
     }
 
-    private fun resolveMonitoredPackage(
-        eventPkg: String,
-        eventClassName: CharSequence?,
-        disabledPackages: Set<String>,
-        nowElapsed: Long
-    ): String? {
-        if (AdDetectionRules.isSystemPackage(eventPkg)) return null
-
-        // Handle Google Mobile Ads out-of-process AdActivity in com.google.android.gms
-        if (eventPkg == AdDetectionRules.ADMOB_AD_ACTIVITY_PACKAGE) {
-            val recentGame = lastEnabledGamePackage
-            val isAdActivity = AdDetectionRules.isAdActivityName(eventClassName) ||
-                (lastWindowPackage == eventPkg && AdDetectionRules.isAdActivityName(lastWindowClassName))
-            if (isAdActivity) {
-                return recentGame?.takeIf { it !in disabledPackages } ?: eventPkg
-            }
-            if (recentGame != null &&
-                recentGame !in disabledPackages &&
-                nowElapsed - lastEnabledGameActiveAtMs <= ADMOB_CONTEXT_WINDOW_MS
-            ) {
-                return recentGame
-            }
-            return null
-        }
-
-        if (eventPkg in disabledPackages) {
-            return null
-        }
-
-        if (eventPkg != AdDetectionRules.YOUTUBE_PACKAGE) {
-            lastEnabledGamePackage = eventPkg
-            lastEnabledGameActiveAtMs = nowElapsed
-        }
-        return eventPkg
-    }
-
     /**
-     * Collects ALL non-system TYPE_APPLICATION windows from service.windows (plus rootInActiveWindow)
-     * so game ad overlays displayed in separate windows are never missed.
+     * Collects non-excluded TYPE_APPLICATION windows from service.windows (plus rootInActiveWindow)
+     * so game ad overlays displayed in separate windows are detected without ever scanning excluded apps.
      */
     private fun collectAllApplicationWindowRoots(
         monitoredPackage: String,
@@ -393,12 +394,10 @@ class SkipFlowAccessibilityService : AccessibilityService() {
                 if (window.type != AccessibilityWindowInfo.TYPE_APPLICATION) continue
                 val winRoot = window.root ?: continue
                 val winPkg = winRoot.packageName?.toString()
-                val allowed = winPkg == null ||
-                    winPkg == monitoredPackage ||
-                    winPkg == AdDetectionRules.ADMOB_AD_ACTIVITY_PACKAGE ||
-                    (!AdDetectionRules.isSystemPackage(winPkg) &&
+                val allowed = (winPkg == null || winPkg == monitoredPackage ||
+                    (!AdDetectionRules.isStrictlyExcludedPackage(winPkg) &&
                         !AdDetectionRules.isInputMethodPackage(winPkg) &&
-                        winPkg !in disabledPackages)
+                        winPkg !in disabledPackages))
                 if (allowed && roots.none { it == winRoot }) {
                     roots.add(winRoot)
                 } else {
@@ -408,7 +407,10 @@ class SkipFlowAccessibilityService : AccessibilityService() {
         }
 
         rootInActiveWindow?.let { activeRoot ->
-            if (roots.none { it == activeRoot }) {
+            val activePkg = activeRoot.packageName?.toString()
+            val allowed = activePkg == null ||
+                (!AdDetectionRules.isStrictlyExcludedPackage(activePkg) && activePkg !in disabledPackages)
+            if (allowed && roots.none { it == activeRoot }) {
                 roots.add(activeRoot)
             } else {
                 safeRecycle(activeRoot)
@@ -473,7 +475,7 @@ class SkipFlowAccessibilityService : AccessibilityService() {
     private fun scanWindowTree(
         root: AccessibilityNodeInfo,
         monitoredPackage: String,
-        initialAdActivityHint: Boolean
+        isRealAdActivity: Boolean
     ): TreeScanResult {
         val (screenW, screenH, density) = getScreenMetrics()
         val queue = ArrayDeque<Triple<AccessibilityNodeInfo, Int, Boolean>>()
@@ -482,7 +484,6 @@ class SkipFlowAccessibilityService : AccessibilityService() {
 
         var visitedNodes = 0
         var hasYouTubeAd = false
-        var isGameAdScreen = initialAdActivityHint
         var bestCandidate: CandidateMatch? = null
         val cornerIconCandidates = mutableListOf<CornerIconCandidate>()
         val tempRect = Rect()
@@ -501,13 +502,9 @@ class SkipFlowAccessibilityService : AccessibilityService() {
                 val isWebViewNode = insideWebView || (clsName?.contains("WebView", ignoreCase = true) == true)
                 val visible = node.isVisibleToUser || isWebViewNode
 
-                if (isYouTube) {
-                    if (!hasYouTubeAd && visible && AdDetectionRules.isYouTubeAdIndicator(viewId, text, desc)) {
+                if (isYouTube && !hasYouTubeAd && visible) {
+                    if (AdDetectionRules.isYouTubeAdIndicator(viewId, text, desc)) {
                         hasYouTubeAd = true
-                    }
-                } else if (!isGameAdScreen && visible) {
-                    if (AdDetectionRules.isGameAdTextMarker(viewId, text, desc)) {
-                        isGameAdScreen = true
                     }
                 }
 
@@ -518,7 +515,8 @@ class SkipFlowAccessibilityService : AccessibilityService() {
                         viewIdResourceName = viewId,
                         text = text,
                         contentDescription = desc,
-                        isClickableOrHasClickableParent = clickableSelfOrParent
+                        isClickableOrHasClickableParent = clickableSelfOrParent,
+                        isAdActivityContext = isRealAdActivity
                     )
 
                     if (targetType != null) {
@@ -538,7 +536,8 @@ class SkipFlowAccessibilityService : AccessibilityService() {
                                 }
                             }
                         }
-                    } else if (!isYouTube && isCornerIconCandidateClass(node, isWebViewNode)) {
+                    } else if (!isYouTube && isRealAdActivity && isCornerIconCandidateClass(node, isWebViewNode)) {
+                        // Corner Detector ONLY runs inside real Ad Activities
                         node.getBoundsInScreen(tempRect)
                         val iconBounds = BoundsRect(tempRect.left, tempRect.top, tempRect.right, tempRect.bottom)
                         if (SafeZoneEvaluator.isCornerAdIconSize(iconBounds, screenW, screenH, density) &&
@@ -578,9 +577,8 @@ class SkipFlowAccessibilityService : AccessibilityService() {
             }
         }
 
-        // If no explicit text/ID match was found and we are inside a game Ad window,
-        // pick the top-16% far-left/far-right corner >> / X icon candidate.
-        if (bestCandidate == null && !isYouTube && isGameAdScreen && cornerIconCandidates.isNotEmpty()) {
+        // Strict AdActivity-only corner icon selection
+        if (bestCandidate == null && !isYouTube && isRealAdActivity && cornerIconCandidates.isNotEmpty()) {
             val chosen = cornerIconCandidates.sortedWith(
                 compareByDescending<CornerIconCandidate> { it.hasPositiveHint }
                     .thenByDescending { it.isClickable }
@@ -711,8 +709,6 @@ class SkipFlowAccessibilityService : AccessibilityService() {
         stageNumber: Int,
         countAsNewAdSkip: Boolean
     ) {
-        // For YouTube targets: try clickable ancestor ACTION_CLICK first, falling back to dispatchGesture.
-        // For Game/WebView/ImageView targets: execute dispatchGesture directly on center of boundsInScreen.
         if (candidate.targetType == AdTargetType.YOUTUBE_SKIP_AD ||
             candidate.targetType == AdTargetType.YOUTUBE_POPUP_DISMISS
         ) {
@@ -810,15 +806,19 @@ class SkipFlowAccessibilityService : AccessibilityService() {
         }
         if (settings.toastOnSkip) {
             val now = SystemClock.elapsedRealtime()
-            if (now - lastToastShownAtMs >= TOAST_COOLDOWN_MS) {
-                lastToastShownAtMs = now
-                val message = when {
-                    targetType == AdTargetType.YOUTUBE_POPUP_DISMISS -> "تم إغلاق نافذة يوتيوب المزعجة"
-                    stageNumber > 1 -> "تم إغلاق المرحلة $stageNumber من الإعلان"
-                    else -> "تم تخطي الإعلان تلقائياً"
-                }
-                Toast.makeText(applicationContext, message, Toast.LENGTH_SHORT).show()
+            val message = when {
+                targetType == AdTargetType.YOUTUBE_POPUP_DISMISS -> "تم إغلاق نافذة يوتيوب المزعجة"
+                stageNumber > 1 -> "تم إغلاق المرحلة $stageNumber من الإعلان"
+                else -> "تم تخطي الإعلان تلقائياً"
             }
+            showDebouncedToast(message, now)
+        }
+    }
+
+    private fun showDebouncedToast(message: String, nowElapsed: Long) {
+        if (nowElapsed - lastToastShownAtMs >= TOAST_COOLDOWN_MS) {
+            lastToastShownAtMs = nowElapsed
+            Toast.makeText(applicationContext, message, Toast.LENGTH_SHORT).show()
         }
     }
 
@@ -902,7 +902,6 @@ class SkipFlowAccessibilityService : AccessibilityService() {
         private const val WINDOW_STATE_SCAN_GAP_MS = 70L
         private const val COUNTDOWN_POLLING_INTERVAL_MS = 800L
         private const val POLLING_MIN_SCAN_GAP_MS = 650L
-        private const val ADMOB_CONTEXT_WINDOW_MS = 30_000L
         private const val TOAST_COOLDOWN_MS = 2_400L
 
         private val _isServiceConnected = MutableStateFlow(false)

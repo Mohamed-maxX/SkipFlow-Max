@@ -18,6 +18,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.rounded.Undo
 import androidx.compose.material.icons.automirrored.rounded.VolumeOff
 import androidx.compose.material.icons.rounded.AutoAwesome
 import androidx.compose.material.icons.rounded.Call
@@ -64,6 +65,7 @@ fun SettingsScreen(
     onVibrateChanged: (Boolean) -> Unit,
     onToastChanged: (Boolean) -> Unit,
     onPauseDuringCallsChanged: (Boolean) -> Unit,
+    onBounceBackFromPlayStoreChanged: (Boolean) -> Unit,
     onCheckForUpdates: () -> Unit,
     onDownloadUpdate: (GitHubReleaseInfo) -> Unit,
     onInstallApk: (File) -> Unit,
@@ -143,6 +145,16 @@ fun SettingsScreen(
                     subtitle = "تعليق عمل المحرك تلقائياً خلال المكالمات الهاتفية والصوتية",
                     checked = uiState.settings.pauseDuringCalls,
                     onCheckedChange = onPauseDuringCallsChanged
+                )
+
+                HorizontalDivider(color = SkipFlowColors.NavyBorder.copy(alpha = 0.6f))
+
+                SettingsToggleRow(
+                    icon = Icons.AutoMirrored.Rounded.Undo,
+                    title = "الرجوع التلقائي من المتجر",
+                    subtitle = "العودة تلقائياً للعبة إذا فُتح متجر Google Play بالخطأ خلال 3 ثوانٍ من محاولة التخطي",
+                    checked = uiState.settings.bounceBackFromPlayStore,
+                    onCheckedChange = onBounceBackFromPlayStoreChanged
                 )
             }
         }

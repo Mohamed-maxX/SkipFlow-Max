@@ -164,6 +164,7 @@ private fun SkipFlowAppShell(viewModel: MainViewModel) {
                     onVibrateChanged = viewModel::setVibrateOnSkip,
                     onToastChanged = viewModel::setToastOnSkip,
                     onPauseDuringCallsChanged = viewModel::setPauseDuringCalls,
+                    onBounceBackFromPlayStoreChanged = viewModel::setBounceBackFromPlayStore,
                     onCheckForUpdates = viewModel::checkForUpdates,
                     onDownloadUpdate = viewModel::downloadUpdate,
                     onInstallApk = { file -> viewModel.installDownloadedApk(context, file) },

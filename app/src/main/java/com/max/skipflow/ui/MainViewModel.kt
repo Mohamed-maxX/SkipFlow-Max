@@ -165,6 +165,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         repository.setPauseDuringCalls(enabled)
     }
 
+    fun setBounceBackFromPlayStore(enabled: Boolean) {
+        repository.setBounceBackFromPlayStore(enabled)
+    }
+
     fun setPackageEnabled(packageName: String, enabled: Boolean) {
         repository.setPackageEnabled(packageName, enabled)
     }

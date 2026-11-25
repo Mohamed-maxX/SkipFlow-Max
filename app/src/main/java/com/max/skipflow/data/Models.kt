@@ -5,7 +5,8 @@ data class SkipFlowSettings(
     val autoMuteYouTubeAds: Boolean = true,
     val vibrateOnSkip: Boolean = true,
     val toastOnSkip: Boolean = true,
-    val pauseDuringCalls: Boolean = true
+    val pauseDuringCalls: Boolean = true,
+    val bounceBackFromPlayStore: Boolean = true
 )
 
 data class DailyStats(
