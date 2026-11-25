@@ -1,15 +1,18 @@
 package com.max.skipflow.engine
 
 /**
- * Dual-recognition rules (text labels + SDK View IDs) for YouTube, AdMob, Unity Ads,
- * AppLovin, and common mobile game interstitial ad controls.
+ * Dual-recognition rules (text/contentDescription contains matching + SDK View IDs +
+ * corner icon heuristics) for YouTube and mobile game ad networks (Pangle, TikTok Ads,
+ * AdMob, Unity Ads, AppLovin, IronSource, Vungle, Mintegral).
  */
 object AdDetectionRules {
 
+    const val SELF_PACKAGE = "com.max.skipflow"
     const val YOUTUBE_PACKAGE = "com.google.android.youtube"
     const val ADMOB_AD_ACTIVITY_PACKAGE = "com.google.android.gms"
 
     private val systemIdlePackages = setOf(
+        SELF_PACKAGE,
         "android",
         "com.android.systemui",
         "com.android.settings",
@@ -19,13 +22,29 @@ object AdDetectionRules {
         "com.google.android.permissioncontroller",
         "com.android.packageinstaller",
         "com.google.android.packageinstaller",
+        "com.android.vending",
         "com.android.launcher",
         "com.android.launcher3",
         "com.google.android.apps.nexuslauncher",
         "com.sec.android.app.launcher",
         "com.miui.home",
         "com.oppo.launcher",
-        "com.huawei.android.launcher"
+        "com.huawei.android.launcher",
+        "com.android.contacts",
+        "com.google.android.contacts",
+        "com.android.dialer",
+        "com.google.android.dialer",
+        "com.samsung.android.dialer",
+        "com.samsung.android.incallui",
+        "com.samsung.android.app.telephonyui",
+        "com.android.mms",
+        "com.google.android.apps.messaging",
+        "com.android.deskclock",
+        "com.google.android.deskclock",
+        "com.android.calculator2",
+        "com.google.android.calculator",
+        "com.miui.securitycenter",
+        "com.coloros.safecenter"
     )
 
     private val imePackages = setOf(
@@ -38,7 +57,9 @@ object AdDetectionRules {
     private val youtubeSkipViewIdSuffixes = setOf(
         "skip_ad_button",
         "skip_ad_button_text",
+        "skip_ad_button_container",
         "skip_ad_button_icon",
+        "modern_skip_ad_text",
         "modern_skip_ad_button",
         "ad_skip_button"
     )
@@ -56,7 +77,10 @@ object AdDetectionRules {
         "ad_skip_button",
         "al_skip_button",
         "unity_ads_skip_button",
-        "unityads_skip_button"
+        "unityads_skip_button",
+        "tt_top_skip",
+        "tt_video_ad_close_layout",
+        "tt_video_ad_close"
     )
 
     private val gameAdCloseViewIdSuffixes = setOf(
@@ -74,7 +98,11 @@ object AdDetectionRules {
         "unity_ads_close_button",
         "unityads_close_button",
         "vungle_close",
-        "mraid_close_indicator"
+        "mraid_close_indicator",
+        "tt_close_iv",
+        "tt_titlebar_close",
+        "mbridge_windvane_close",
+        "mbridge_iv_close"
     )
 
     private val youtubeAdOverlayViewIdSuffixes = setOf(
@@ -82,6 +110,8 @@ object AdDetectionRules {
         "ad_countdown",
         "ad_overlay",
         "skip_ad_button",
+        "skip_ad_button_container",
+        "modern_skip_ad_text",
         "modern_skip_ad_button",
         "player_learn_more_button",
         "visit_advertiser_button",
@@ -89,30 +119,30 @@ object AdDetectionRules {
         "ad_badge"
     )
 
-    private val skipExactTexts = setOf(
-        "skip ad",
-        "skip ads",
-        "skip",
-        "skip video",
+    // Required YouTube & general skip phrases matched via case-insensitive contains()
+    private val skipContainsKeywords = listOf(
         "تخطي الإعلان",
         "تخطي الاعلان",
         "تخطي الإعلانات",
         "تخطي الاعلانات",
-        "تخطي"
+        "التخطي",
+        "تخطي",
+        "skip ads",
+        "skip ad",
+        "skip"
     )
 
-    private val gameCloseExactTexts = setOf(
-        "إغلاق",
-        "اغلاق",
+    private val gameCloseKeywords = listOf(
         "إغلاق الإعلان",
         "اغلاق الاعلان",
-        "close",
+        "إغلاق",
+        "اغلاق",
         "close ad",
+        "close",
         "dismiss",
         "×",
         "✕",
-        "✖",
-        "x"
+        "✖"
     )
 
     private val youtubePopupDismissTexts = setOf(
@@ -132,7 +162,7 @@ object AdDetectionRules {
         pattern = """(?i).*(\b(in|after|خلال|بعد)\s*\d+|\d+\s*(s|sec|secs|ث|ثانية|ثوان|ثواني)\b|^\d+$).*"""
     )
 
-    private val youtubeAdTextMarkers = setOf(
+    private val youtubeAdTextMarkers = listOf(
         "ad ·",
         "إعلان ·",
         "اعلان ·",
@@ -140,20 +170,123 @@ object AdDetectionRules {
         "skip ads",
         "تخطي الإعلان",
         "تخطي الاعلان",
+        "التخطي",
         "visit advertiser",
         "زيارة موقع المعلن",
         "why this ad"
     )
 
+    private val adActivityKeywords = listOf(
+        "adactivity",
+        "openadsdk",
+        "pangle",
+        "applovin",
+        "unity",
+        "ironsource",
+        "vungle",
+        "mbridge",
+        "mintegral",
+        "admob",
+        "inmobi",
+        "chartboost",
+        "fyber",
+        "interstitial",
+        "rewarded"
+    )
+
+    private val gameAdScreenWordRegex = Regex("""(?i)\bad\b""")
+
+    private val gameAdScreenMarkers = listOf(
+        "إعلان",
+        "اعلان",
+        "اعرف المزيد",
+        "learn more",
+        "sponsored",
+        "ممول",
+        "مموّل"
+    )
+
+    private val excludedCornerIconKeywords = listOf(
+        "mute",
+        "unmute",
+        "volume",
+        "sound",
+        "audio",
+        "speaker",
+        "صوت",
+        "كتم",
+        "feedback",
+        "report",
+        "info",
+        "privacy",
+        "adchoices",
+        "ad_choices",
+        "why",
+        "policy",
+        "إبلاغ",
+        "بلاغ",
+        "معلومات",
+        "خيارات الإعلان"
+    )
+
+    private val positiveCornerIconKeywords = listOf(
+        "skip",
+        "close",
+        "dismiss",
+        "next",
+        "forward",
+        "تخطي",
+        "إغلاق",
+        ">>"
+    )
+
     fun isSystemPackage(packageName: String): Boolean {
         if (packageName in systemIdlePackages) return true
         return packageName.startsWith("com.android.internal") ||
+            packageName.startsWith("com.android.providers.") ||
+            packageName.startsWith("com.android.camera") ||
             packageName.startsWith("com.qualcomm.") ||
             packageName.startsWith("com.mediatek.")
     }
 
     fun isInputMethodPackage(packageName: String): Boolean {
         return packageName in imePackages || packageName.contains("inputmethod") || packageName.contains("keyboard")
+    }
+
+    fun isAdActivityName(classNameOrPackage: CharSequence?): Boolean {
+        if (classNameOrPackage.isNullOrBlank()) return false
+        val lower = classNameOrPackage.toString().lowercase()
+        return adActivityKeywords.any { keyword -> lower.contains(keyword) }
+    }
+
+    fun isGameAdTextMarker(
+        viewIdResourceName: String?,
+        text: CharSequence?,
+        contentDescription: CharSequence?
+    ): Boolean {
+        val idLower = viewIdResourceName?.lowercase()
+        if (idLower != null && (
+                idLower.contains(":id/tt_") ||
+                    idLower.contains(":id/al_") ||
+                    idLower.contains(":id/unity") ||
+                    idLower.contains(":id/ia_") ||
+                    idLower.contains(":id/mbridge") ||
+                    idLower.contains(":id/vungle") ||
+                    idLower.contains("applovin") ||
+                    idLower.contains("openadsdk")
+                )
+        ) {
+            return true
+        }
+        return containsAdScreenMarker(text) || containsAdScreenMarker(contentDescription)
+    }
+
+    private fun containsAdScreenMarker(raw: CharSequence?): Boolean {
+        if (raw.isNullOrBlank()) return false
+        val lower = raw.toString().trim().lowercase()
+        if (lower.length > 80) return false
+        if (gameAdScreenMarkers.any { marker -> lower.contains(marker) }) return true
+        return gameAdScreenWordRegex.containsMatchIn(lower)
     }
 
     fun extractViewIdSuffix(viewIdResourceName: String?): String? {
@@ -167,7 +300,7 @@ object AdDetectionRules {
         return raw.trim().lowercase().takeIf { it.isNotEmpty() }
     }
 
-    fun normalizeText(raw: CharSequence?): String? {
+    fun normalizeText(raw: CharSequence?, maxLength: Int = 64): String? {
         if (raw.isNullOrBlank()) return null
         val cleaned = raw.toString()
             .replace('\u00A0', ' ')
@@ -176,7 +309,7 @@ object AdDetectionRules {
             .trim()
             .replace(Regex("""\s+"""), " ")
             .lowercase()
-        return cleaned.takeIf { it.isNotEmpty() && it.length <= 48 }
+        return cleaned.takeIf { it.isNotEmpty() && it.length <= maxLength }
     }
 
     fun isCountdownText(normalizedText: String): Boolean {
@@ -194,13 +327,13 @@ object AdDetectionRules {
         }
         val normText = normalizeText(text)
         val normDesc = normalizeText(contentDescription)
-        return matchesAdMarker(normText) || matchesAdMarker(normDesc)
+        return matchesYouTubeAdMarker(normText) || matchesYouTubeAdMarker(normDesc)
     }
 
-    private fun matchesAdMarker(normalized: String?): Boolean {
+    private fun matchesYouTubeAdMarker(normalized: String?): Boolean {
         if (normalized == null) return false
-        if (normalized in skipExactTexts) return true
-        return youtubeAdTextMarkers.any { marker -> normalized.contains(marker) }
+        if (youtubeAdTextMarkers.any { marker -> normalized.contains(marker) }) return true
+        return matchesSkipContains(normalized)
     }
 
     fun matchCandidate(
@@ -244,7 +377,7 @@ object AdDetectionRules {
             return AdTargetType.YOUTUBE_SKIP_AD
         }
 
-        if (isExactSkipLabel(normText) || isExactSkipLabel(normDesc)) {
+        if (matchesSkipContains(normText) || matchesSkipContains(normDesc)) {
             return AdTargetType.YOUTUBE_SKIP_AD
         }
 
@@ -269,18 +402,22 @@ object AdDetectionRules {
         isClickable: Boolean
     ): AdTargetType? {
         if (idSuffix != null) {
-            if (idSuffix in gameAdSkipViewIdSuffixes) {
+            if (idSuffix in gameAdSkipViewIdSuffixes ||
+                (idSuffix.startsWith("tt_") && idSuffix.contains("skip"))
+            ) {
                 return AdTargetType.GAME_AD_SKIP
             }
             if (idSuffix in gameAdCloseViewIdSuffixes ||
-                idSuffix.startsWith("al_") && (idSuffix.contains("close") || idSuffix.contains("skip")) ||
-                idSuffix.startsWith("unity") && (idSuffix.contains("close") || idSuffix.contains("skip"))
+                (idSuffix.startsWith("al_") && (idSuffix.contains("close") || idSuffix.contains("skip"))) ||
+                (idSuffix.startsWith("unity") && (idSuffix.contains("close") || idSuffix.contains("skip"))) ||
+                (idSuffix.startsWith("tt_") && idSuffix.contains("close")) ||
+                (idSuffix.startsWith("mbridge_") && idSuffix.contains("close"))
             ) {
                 return if (idSuffix.contains("skip")) AdTargetType.GAME_AD_SKIP else AdTargetType.GAME_AD_CLOSE
             }
         }
 
-        if (isExactSkipLabel(normText) || isExactSkipLabel(normDesc)) {
+        if (matchesSkipContains(normText) || matchesSkipContains(normDesc)) {
             return AdTargetType.GAME_AD_SKIP
         }
 
@@ -288,18 +425,62 @@ object AdDetectionRules {
             return null
         }
 
-        val isCloseLabel = (normText != null && normText in gameCloseExactTexts) ||
-            (normDesc != null && normDesc in gameCloseExactTexts)
-        if (isCloseLabel) {
+        if (matchesGameCloseContains(normText) || matchesGameCloseContains(normDesc)) {
             return AdTargetType.GAME_AD_CLOSE
         }
 
         return null
     }
 
-    private fun isExactSkipLabel(normalized: String?): Boolean {
+    fun isExcludedCornerIcon(
+        viewIdResourceName: String?,
+        text: CharSequence?,
+        contentDescription: CharSequence?
+    ): Boolean {
+        val combined = listOfNotNull(
+            viewIdResourceName?.lowercase(),
+            text?.toString()?.lowercase(),
+            contentDescription?.toString()?.lowercase()
+        ).joinToString(" ")
+
+        if (combined.isNotEmpty() && excludedCornerIconKeywords.any { combined.contains(it) }) {
+            return true
+        }
+
+        val normText = normalizeText(text, maxLength = 32)
+        if (normText != null) {
+            if (isCountdownText(normText)) return true
+            // Avoid mistapping long corner labels that are not close/skip symbols
+            val isExplicitPositive = positiveCornerIconKeywords.any { normText.contains(it) } ||
+                normText in setOf("x", "×", "✕", "✖", ">", ">>")
+            if (normText.length > 4 && !isExplicitPositive) {
+                return true
+            }
+        }
+        return false
+    }
+
+    fun hasPositiveCornerIconHint(
+        viewIdResourceName: String?,
+        text: CharSequence?,
+        contentDescription: CharSequence?
+    ): Boolean {
+        val combined = listOfNotNull(
+            viewIdResourceName?.lowercase(),
+            text?.toString()?.lowercase(),
+            contentDescription?.toString()?.lowercase()
+        ).joinToString(" ")
+        return positiveCornerIconKeywords.any { combined.contains(it) }
+    }
+
+    private fun matchesSkipContains(normalized: String?): Boolean {
         if (normalized == null) return false
-        if (normalized in skipExactTexts) return true
-        return normalized.startsWith("skip ad") || normalized.startsWith("تخطي الإعلان") || normalized.startsWith("تخطي الاعلان")
+        return skipContainsKeywords.any { keyword -> normalized.contains(keyword, ignoreCase = true) }
+    }
+
+    private fun matchesGameCloseContains(normalized: String?): Boolean {
+        if (normalized == null) return false
+        if (normalized == "x") return true
+        return gameCloseKeywords.any { keyword -> normalized.contains(keyword, ignoreCase = true) }
     }
 }

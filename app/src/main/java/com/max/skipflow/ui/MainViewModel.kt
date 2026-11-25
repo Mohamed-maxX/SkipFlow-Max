@@ -32,7 +32,7 @@ enum class AppFilterTab {
 data class MainUiState(
     val settings: SkipFlowSettings = SkipFlowSettings(),
     val stats: DailyStats = DailyStats(),
-    val enabledPackages: Set<String> = emptySet(),
+    val disabledPackages: Set<String> = emptySet(),
     val healthStatus: HealthStatus = HealthStatus(),
     val isServiceConnected: Boolean = false,
     val isCallInProgress: Boolean = false,
@@ -42,14 +42,17 @@ data class MainUiState(
     val appFilterTab: AppFilterTab = AppFilterTab.ALL,
     val otaUpdateState: OtaUpdateState = OtaUpdateState.Idle
 ) {
+    val enabledAppsCount: Int
+        get() = installedApps.count { it.packageName !in disabledPackages }
+
     val filteredApps: List<InstalledAppInfo>
         get() {
             val query = searchQuery.trim().lowercase()
             return installedApps.filter { app ->
                 val matchesFilter = when (appFilterTab) {
                     AppFilterTab.ALL -> true
-                    AppFilterTab.ENABLED -> app.packageName in enabledPackages
-                    AppFilterTab.DISABLED -> app.packageName !in enabledPackages
+                    AppFilterTab.ENABLED -> app.packageName !in disabledPackages
+                    AppFilterTab.DISABLED -> app.packageName in disabledPackages
                 }
                 val matchesQuery = query.isEmpty() ||
                     app.appName.lowercase().contains(query) ||
@@ -96,14 +99,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     val uiState: StateFlow<MainUiState> = combine(
         repository.settings,
         repository.stats,
-        repository.enabledPackages,
+        repository.disabledPackages,
         appListState,
         systemStatusState
-    ) { settings, stats, enabledPkgs, appsSlice, sysSlice ->
+    ) { settings, stats, disabledPkgs, appsSlice, sysSlice ->
         MainUiState(
             settings = settings,
             stats = stats,
-            enabledPackages = enabledPkgs,
+            disabledPackages = disabledPkgs,
             healthStatus = sysSlice.health,
             isServiceConnected = sysSlice.connected,
             isCallInProgress = sysSlice.inCall,

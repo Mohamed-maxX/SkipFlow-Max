@@ -58,7 +58,7 @@ private class FakeVolumeBackend(var volume: Int) : MediaVolumeBackend {
 class RepositoryAndVolumeTest {
 
     @Test
-    fun `YouTube is enabled by default and stats reset cleanly on day rollover`() {
+    fun `blacklist mode enables YouTube and external games by default while excluding system apps`() {
         var currentDay = "2026-11-25"
         val repo = SkipFlowRepository(
             storage = InMemoryKeyValueStorage(),
@@ -66,7 +66,15 @@ class RepositoryAndVolumeTest {
         )
 
         assertTrue(repo.isPackageEnabled(AdDetectionRules.YOUTUBE_PACKAGE))
-        assertFalse(repo.isPackageEnabled("com.example.game"))
+        assertTrue(repo.isPackageEnabled("com.example.newgame"))
+        assertFalse(repo.isPackageEnabled("com.android.systemui"))
+        assertFalse(repo.isPackageEnabled(AdDetectionRules.SELF_PACKAGE))
+
+        // User can disable a specific app from App Manager
+        repo.setPackageEnabled("com.example.newgame", false)
+        assertFalse(repo.isPackageEnabled("com.example.newgame"))
+        repo.setPackageEnabled("com.example.newgame", true)
+        assertTrue(repo.isPackageEnabled("com.example.newgame"))
 
         repo.recordAdSkipped(15L)
         assertEquals(1, repo.stats.value.skippedToday)

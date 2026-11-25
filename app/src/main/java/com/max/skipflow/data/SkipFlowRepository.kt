@@ -75,8 +75,9 @@ class SkipFlowRepository(
     private val _settings = MutableStateFlow(loadInitialSettings())
     val settings: StateFlow<SkipFlowSettings> = _settings.asStateFlow()
 
-    private val _enabledPackages = MutableStateFlow(loadInitialEnabledPackages())
-    val enabledPackages: StateFlow<Set<String>> = _enabledPackages.asStateFlow()
+    // Blacklist mode: all non-system external apps & games are enabled by default unless listed here.
+    private val _disabledPackages = MutableStateFlow(loadInitialDisabledPackages())
+    val disabledPackages: StateFlow<Set<String>> = _disabledPackages.asStateFlow()
 
     private val _stats = MutableStateFlow(loadStatsForToday())
     val stats: StateFlow<DailyStats> = _stats.asStateFlow()
@@ -91,15 +92,15 @@ class SkipFlowRepository(
         )
     }
 
-    private fun loadInitialEnabledPackages(): Set<String> {
-        val initialized = storage.getBoolean(KEY_APP_LIST_INITIALIZED, false)
+    private fun loadInitialDisabledPackages(): Set<String> {
+        val initialized = storage.getBoolean(KEY_BLACKLIST_INITIALIZED, false)
         if (!initialized) {
-            val defaults = setOf(AdDetectionRules.YOUTUBE_PACKAGE)
-            storage.putStringSet(KEY_ENABLED_PACKAGES, defaults)
-            storage.putBoolean(KEY_APP_LIST_INITIALIZED, true)
+            val defaults = emptySet<String>()
+            storage.putStringSet(KEY_DISABLED_PACKAGES, defaults)
+            storage.putBoolean(KEY_BLACKLIST_INITIALIZED, true)
             return defaults
         }
-        return storage.getStringSet(KEY_ENABLED_PACKAGES, setOf(AdDetectionRules.YOUTUBE_PACKAGE))
+        return storage.getStringSet(KEY_DISABLED_PACKAGES, emptySet())
     }
 
     private fun loadStatsForToday(): DailyStats {
@@ -155,19 +156,22 @@ class SkipFlowRepository(
 
     fun setPackageEnabled(packageName: String, enabled: Boolean) {
         synchronized(lock) {
-            val updated = _enabledPackages.value.toMutableSet()
+            val updated = _disabledPackages.value.toMutableSet()
             if (enabled) {
-                updated.add(packageName)
-            } else {
                 updated.remove(packageName)
+            } else {
+                updated.add(packageName)
             }
-            storage.putStringSet(KEY_ENABLED_PACKAGES, updated)
-            _enabledPackages.value = updated.toSet()
+            storage.putStringSet(KEY_DISABLED_PACKAGES, updated)
+            _disabledPackages.value = updated.toSet()
         }
     }
 
     fun isPackageEnabled(packageName: String): Boolean {
-        return packageName in _enabledPackages.value
+        if (AdDetectionRules.isSystemPackage(packageName) || AdDetectionRules.isInputMethodPackage(packageName)) {
+            return false
+        }
+        return packageName !in _disabledPackages.value
     }
 
     fun refreshDateRolloverIfNeeded() {
@@ -209,8 +213,8 @@ class SkipFlowRepository(
         private const val KEY_VIBRATE_ON_SKIP = "vibrate_on_skip"
         private const val KEY_TOAST_ON_SKIP = "toast_on_skip"
         private const val KEY_PAUSE_DURING_CALLS = "pause_during_calls"
-        private const val KEY_APP_LIST_INITIALIZED = "app_list_initialized"
-        private const val KEY_ENABLED_PACKAGES = "enabled_packages"
+        private const val KEY_BLACKLIST_INITIALIZED = "blacklist_mode_initialized"
+        private const val KEY_DISABLED_PACKAGES = "disabled_packages"
         private const val KEY_STATS_DATE = "stats_date"
         private const val KEY_SKIPPED_TODAY = "skipped_today"
         private const val KEY_SAVED_SECONDS_TODAY = "saved_seconds_today"

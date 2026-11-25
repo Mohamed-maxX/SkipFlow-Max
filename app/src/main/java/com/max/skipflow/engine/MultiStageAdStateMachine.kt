@@ -12,8 +12,8 @@ sealed interface StageDecision {
 }
 
 /**
- * Handles multi-stage game ads (e.g. initial close/skip X followed by a second end-card X)
- * while debouncing duplicate taps on the same fading control and avoiding double-counting stats.
+ * Handles multi-stage game ads (e.g. initial close/skip >> or X followed by a second end-card X)
+ * while enforcing a 1500ms cooldown to prevent repeated clicks and avoid double-counting stats.
  */
 class MultiStageAdStateMachine {
 
@@ -38,11 +38,12 @@ class MultiStageAdStateMachine {
         }
 
         val elapsedSinceLastTap = nowMs - lastTapAtMs
-        if (elapsedSinceLastTap in 0 until MIN_TAP_GAP_MS) {
-            return StageDecision.Ignore("tap_debounce")
+        if (lastTapAtMs > 0L && elapsedSinceLastTap in 0 until TAP_COOLDOWN_MS) {
+            return StageDecision.Ignore("tap_cooldown_1500ms")
         }
 
         val isSameSession = activePackage == packageName &&
+            lastTapAtMs > 0L &&
             elapsedSinceLastTap in 0 until MULTI_STAGE_WINDOW_MS
 
         if (!isSameSession) {
@@ -84,9 +85,9 @@ class MultiStageAdStateMachine {
     }
 
     companion object {
-        const val MIN_TAP_GAP_MS = 700L
-        const val SAME_SPOT_SETTLE_MS = 1450L
-        const val MULTI_STAGE_WINDOW_MS = 7500L
+        const val TAP_COOLDOWN_MS = 1500L
+        const val SAME_SPOT_SETTLE_MS = 1800L
+        const val MULTI_STAGE_WINDOW_MS = 8000L
         const val POPUP_COOLDOWN_MS = 2500L
         const val SAME_SPOT_TOLERANCE_PX = 20
         const val MAX_STAGES_PER_AD = 3

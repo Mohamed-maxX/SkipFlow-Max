@@ -107,7 +107,8 @@ fun HomeScreen(
         )
 
         ContextAwareAppsCard(
-            enabledAppsCount = uiState.enabledPackages.size,
+            enabledAppsCount = uiState.enabledAppsCount,
+            disabledAppsCount = uiState.disabledPackages.size,
             onNavigateToApps = onNavigateToApps
         )
 
@@ -570,6 +571,7 @@ private fun HealthCheckRow(
 @Composable
 private fun ContextAwareAppsCard(
     enabledAppsCount: Int,
+    disabledAppsCount: Int,
     onNavigateToApps: () -> Unit
 ) {
     Card(
@@ -610,7 +612,11 @@ private fun ContextAwareAppsCard(
                         fontSize = 14.sp
                     )
                     Text(
-                        text = "مفعّل لـ $enabledAppsCount تطبيقات • خمول تام في غيرها",
+                        text = if (disabledAppsCount == 0) {
+                            "كل التطبيقات والألعاب مفعّلة تلقائياً ($enabledAppsCount) • خمول بالنظام"
+                        } else {
+                            "مفعّل لـ $enabledAppsCount تطبيق • معطّل: $disabledAppsCount"
+                        },
                         style = MaterialTheme.typography.bodyMedium,
                         fontSize = 12.sp
                     )

@@ -1,7 +1,7 @@
 package com.max.skipflow.engine
 
 /**
- * Pure JVM-compatible bounds rectangle used by safe-zone and human-tap logic
+ * Pure JVM-compatible bounds rectangle used by safe-zone and tap logic
  * so core ad-skipping heuristics can be unit-tested without Android framework mocks.
  */
 data class BoundsRect(
@@ -21,5 +21,6 @@ enum class AdTargetType(val estimatedSavedSeconds: Long) {
     YOUTUBE_SKIP_AD(15L),
     YOUTUBE_POPUP_DISMISS(4L),
     GAME_AD_SKIP(20L),
-    GAME_AD_CLOSE(20L)
+    GAME_AD_CLOSE(20L),
+    GAME_AD_ICON(20L)
 }

@@ -65,7 +65,7 @@ fun AppsScreen(
     loadAppIcon: suspend (String) -> ImageBitmap?,
     modifier: Modifier = Modifier
 ) {
-    val enabledCount = uiState.installedApps.count { it.packageName in uiState.enabledPackages }
+    val enabledCount = uiState.installedApps.count { it.packageName !in uiState.disabledPackages }
     val disabledCount = (uiState.installedApps.size - enabledCount).coerceAtLeast(0)
     val displayedApps = uiState.filteredApps
 
@@ -82,7 +82,7 @@ fun AppsScreen(
                 style = MaterialTheme.typography.titleLarge
             )
             Text(
-                text = "قائمة السماح والحظر — تفعيل التخطي الذكي للتطبيقات المحددة فقط",
+                text = "جميع التطبيقات والألعاب مفعّلة تلقائياً (Blacklist) — يمكنك تعطيل أي تطبيق هنا",
                 style = MaterialTheme.typography.bodyMedium
             )
         }
@@ -222,7 +222,7 @@ fun AppsScreen(
                         items = displayedApps,
                         key = { it.packageName }
                     ) { app ->
-                        val isEnabled = app.packageName in uiState.enabledPackages
+                        val isEnabled = app.packageName !in uiState.disabledPackages
                         AppListItemRow(
                             app = app,
                             isEnabled = isEnabled,

@@ -27,24 +27,24 @@ class HumanTouchGeneratorTest {
     }
 
     @Test
-    fun `multi-stage state machine handles end-card X without double counting`() {
+    fun `multi-stage state machine enforces 1500ms cooldown and handles second stage icon`() {
         val machine = MultiStageAdStateMachine()
         val stage1Bounds = BoundsRect(950, 80, 1040, 170)
         val stage2Bounds = BoundsRect(40, 80, 130, 170)
 
-        val d1 = machine.evaluateCandidate("com.game.one", stage1Bounds, AdTargetType.GAME_AD_CLOSE, 1000L)
+        val d1 = machine.evaluateCandidate("com.game.one", stage1Bounds, AdTargetType.GAME_AD_ICON, 1000L)
         assertEquals(StageDecision.ExecuteTap(stageNumber = 1, countAsNewAdSkip = true), d1)
 
-        // Rapid duplicate event at 1200ms should debounce
-        val dup = machine.evaluateCandidate("com.game.one", stage1Bounds, AdTargetType.GAME_AD_CLOSE, 1200L)
-        assertTrue(dup is StageDecision.Ignore)
+        // Rapid event within 1500ms cooldown must be ignored
+        val cooldownIgnored = machine.evaluateCandidate("com.game.one", stage2Bounds, AdTargetType.GAME_AD_ICON, 2000L)
+        assertTrue(cooldownIgnored is StageDecision.Ignore)
 
-        // Second stage end-card X appears at 2200ms in another corner
-        val d2 = machine.evaluateCandidate("com.game.one", stage2Bounds, AdTargetType.GAME_AD_CLOSE, 2200L)
+        // After 1500ms cooldown, second stage end-card X executes without double counting
+        val d2 = machine.evaluateCandidate("com.game.one", stage2Bounds, AdTargetType.GAME_AD_CLOSE, 2600L)
         assertEquals(StageDecision.ExecuteTap(stageNumber = 2, countAsNewAdSkip = false), d2)
 
         // New ad much later resets session
-        val nextAd = machine.evaluateCandidate("com.game.one", stage1Bounds, AdTargetType.GAME_AD_CLOSE, 15_000L)
+        val nextAd = machine.evaluateCandidate("com.game.one", stage1Bounds, AdTargetType.GAME_AD_ICON, 15_000L)
         assertEquals(StageDecision.ExecuteTap(stageNumber = 1, countAsNewAdSkip = true), nextAd)
     }
 }
