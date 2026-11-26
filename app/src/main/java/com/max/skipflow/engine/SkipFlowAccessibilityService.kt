@@ -43,6 +43,7 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.util.ArrayDeque
+import java.util.Locale
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 
@@ -54,6 +55,7 @@ class SkipFlowAccessibilityService : AccessibilityService() {
     private lateinit var volumeController: YouTubeVolumeController
     private lateinit var openCvAdIconDetector: OpenCvAdIconDetector
     private lateinit var tesseractOcrEngine: TesseractOcrEngine
+    private lateinit var debugOverlayManager: DebugOverlayManager
 
     private val mainHandler = Handler(Looper.getMainLooper())
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
@@ -64,19 +66,25 @@ class SkipFlowAccessibilityService : AccessibilityService() {
     private val playStoreRedirectGuard = PlayStoreRedirectGuard()
 
     private var pollingJob: Job? = null
+    private var settingsObserverJob: Job? = null
     private var activeMonitoredPackage: String? = null
     private var currentActivityPackage: String? = null
     private var currentActivityClassName: String? = null
     private var lastScanElapsedMs: Long = 0L
     private var lastVisionScanStartedMs: Long = 0L
     private var lastToastShownAtMs: Long = 0L
+    private var lastScreenshotStatus: String = "-"
+    private var lastDebugDetail: String = "جاهز"
     private var pendingVolumeRestoreRunnable: Runnable? = null
     private var isScreenReceiverRegistered: Boolean = false
 
     private val screenStateReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             when (intent?.action) {
-                Intent.ACTION_SCREEN_OFF -> stopCountdownPolling()
+                Intent.ACTION_SCREEN_OFF -> {
+                    stopCountdownPolling()
+                    debugOverlayManager.hide()
+                }
                 Intent.ACTION_SCREEN_ON, Intent.ACTION_USER_PRESENT -> {
                     val pkg = activeMonitoredPackage
                     if (pkg != null && repository.settings.value.engineEnabled) {
@@ -93,10 +101,19 @@ class SkipFlowAccessibilityService : AccessibilityService() {
         repository = container.skipFlowRepository
         openCvAdIconDetector = container.openCvAdIconDetector
         tesseractOcrEngine = container.tesseractOcrEngine
+        debugOverlayManager = DebugOverlayManager(this)
         audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
         powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
         volumeController = YouTubeVolumeController(AndroidMediaVolumeBackend(audioManager))
         registerScreenStateReceiver()
+
+        settingsObserverJob = serviceScope.launch {
+            repository.settings.collect { settings ->
+                if (!settings.liveDebugOverlayEnabled || !settings.engineEnabled) {
+                    debugOverlayManager.hide()
+                }
+            }
+        }
     }
 
     override fun onServiceConnected() {
@@ -111,6 +128,7 @@ class SkipFlowAccessibilityService : AccessibilityService() {
             activeMonitoredPackage = null
             _currentActivePackage.value = null
             volumeController.forceRestore()
+            debugOverlayManager.hide()
             return
         }
 
@@ -136,9 +154,12 @@ class SkipFlowAccessibilityService : AccessibilityService() {
                 activeMonitoredPackage = null
                 _currentActivePackage.value = null
                 performGlobalAction(GLOBAL_ACTION_BACK)
-                if (currentSettings.toastOnSkip) {
-                    showDebouncedToast("تم الرجوع تلقائياً من المتجر", nowElapsed)
-                }
+                emitStatusUpdate(
+                    pkg = eventPkg,
+                    isAdScreen = false,
+                    screenshotStatus = "-",
+                    detail = "رجوع تلقائي من المتجر"
+                )
                 return
             }
 
@@ -155,6 +176,12 @@ class SkipFlowAccessibilityService : AccessibilityService() {
             if (eventPkg != AdDetectionRules.YOUTUBE_PACKAGE) {
                 volumeController.forceRestore()
             }
+            pushDebugOverlay(
+                pkg = eventPkg,
+                isAdScreen = false,
+                screenshotStatus = "-",
+                detail = "مستثنى"
+            )
             return
         }
 
@@ -166,6 +193,12 @@ class SkipFlowAccessibilityService : AccessibilityService() {
             if (eventPkg != AdDetectionRules.YOUTUBE_PACKAGE) {
                 volumeController.forceRestore()
             }
+            pushDebugOverlay(
+                pkg = eventPkg,
+                isAdScreen = false,
+                screenshotStatus = "-",
+                detail = "معطّل من القائمة"
+            )
             return
         }
 
@@ -176,10 +209,15 @@ class SkipFlowAccessibilityService : AccessibilityService() {
         if (currentSettings.pauseDuringCalls && CallStateMonitor.isCallActive(audioManager)) {
             stopCountdownPolling()
             volumeController.forceRestore()
+            pushDebugOverlay(
+                pkg = eventPkg,
+                isAdScreen = false,
+                screenshotStatus = "-",
+                detail = "متوقف (مكالمة)"
+            )
             return
         }
 
-        // Start lightweight 800ms polling while inside an active monitored app/game
         ensureCountdownPollingActive()
 
         val minInterval = if (isWindowChange) WINDOW_STATE_SCAN_GAP_MS else CONTENT_SCAN_THROTTLE_MS
@@ -197,6 +235,7 @@ class SkipFlowAccessibilityService : AccessibilityService() {
         stopCountdownPolling()
         cancelPendingVolumeRestore()
         volumeController.forceRestore()
+        debugOverlayManager.hide()
         _isServiceConnected.value = false
     }
 
@@ -204,6 +243,7 @@ class SkipFlowAccessibilityService : AccessibilityService() {
         stopCountdownPolling()
         cancelPendingVolumeRestore()
         volumeController.forceRestore()
+        debugOverlayManager.hide()
         _isServiceConnected.value = false
         activeMonitoredPackage = null
         _currentActivePackage.value = null
@@ -212,9 +252,12 @@ class SkipFlowAccessibilityService : AccessibilityService() {
 
     override fun onDestroy() {
         stopCountdownPolling()
+        settingsObserverJob?.cancel()
         cancelPendingVolumeRestore()
         volumeController.forceRestore()
+        debugOverlayManager.hide()
         unregisterScreenStateReceiver()
+        openCvAdIconDetector.release()
         tesseractOcrEngine.release()
         visionExecutor.shutdownNow()
         serviceScope.cancel()
@@ -229,6 +272,8 @@ class SkipFlowAccessibilityService : AccessibilityService() {
         if (eventPkg != currentActivityPackage) {
             currentActivityPackage = eventPkg
             currentActivityClassName = cls
+            lastScreenshotStatus = "-"
+            lastDebugDetail = "انتقال"
             return
         }
         if (cls.isNullOrBlank()) return
@@ -343,6 +388,7 @@ class SkipFlowAccessibilityService : AccessibilityService() {
         var totalVisitedNodes = 0
         var hasWebViewOrSurface = false
         var bestCandidate: CandidateMatch? = null
+        val excludedCornerRects = mutableListOf<BoundsRect>()
         val realAdActivityActive = isCurrentActivityRealAdScreen(monitoredPackage)
 
         try {
@@ -362,6 +408,7 @@ class SkipFlowAccessibilityService : AccessibilityService() {
                 if (result.hasYouTubeAdIndicator) {
                     hasYouTubeAd = true
                 }
+                excludedCornerRects.addAll(result.excludedRects)
                 val match = result.bestCandidate
                 if (match != null) {
                     if (bestCandidate == null || match.priority < bestCandidate.priority) {
@@ -391,16 +438,29 @@ class SkipFlowAccessibilityService : AccessibilityService() {
 
                 if (decision is StageDecision.ExecuteTap) {
                     playStoreRedirectGuard.recordGameOrAdSkipAttempt(monitoredPackage, nowElapsed)
+                    pushDebugOverlay(
+                        pkg = monitoredPackage,
+                        isAdScreen = realAdActivityActive || hasYouTubeAd,
+                        screenshotStatus = lastScreenshotStatus,
+                        detail = "A11y: ${winner.targetType.name}"
+                    )
                     executeTargetAction(
                         candidate = winner,
                         stageNumber = decision.stageNumber,
                         countAsNewAdSkip = decision.countAsNewAdSkip
                     )
+                } else if (decision is StageDecision.Ignore) {
+                    pushDebugOverlay(
+                        pkg = monitoredPackage,
+                        isAdScreen = realAdActivityActive || hasYouTubeAd,
+                        screenshotStatus = lastScreenshotStatus,
+                        detail = "تجاهل: ${decision.reason}"
+                    )
                 }
                 return
             }
 
-            // Fallback to OpenCV + Tesseract offline vision when regular Accessibility finds nothing
+            // Fallback to Android 11+ takeScreenshot() -> ARGB_8888 Software Bitmap -> OpenCV Template Matching + Tesseract OCR
             if (shouldAttemptVisionFallback(
                     monitoredPackage = monitoredPackage,
                     isRealAdActivity = realAdActivityActive,
@@ -411,7 +471,19 @@ class SkipFlowAccessibilityService : AccessibilityService() {
             ) {
                 captureAndAnalyzeScreen(
                     monitoredPackage = monitoredPackage,
-                    isRealAdActivity = realAdActivityActive
+                    isRealAdActivity = realAdActivityActive,
+                    excludedRects = excludedCornerRects.toList()
+                )
+            } else {
+                pushDebugOverlay(
+                    pkg = monitoredPackage,
+                    isAdScreen = realAdActivityActive || hasYouTubeAd,
+                    screenshotStatus = lastScreenshotStatus,
+                    detail = if (monitoredPackage == AdDetectionRules.YOUTUBE_PACKAGE) {
+                        if (hasYouTubeAd) "إعلان يوتيوب (انتظار التخطي)" else "يوتيوب طبيعي"
+                    } else {
+                        lastDebugDetail
+                    }
                 )
             }
         } finally {
@@ -435,14 +507,14 @@ class SkipFlowAccessibilityService : AccessibilityService() {
         if (isVisionScanInFlight.get()) return false
         if (nowElapsed - lastVisionScanStartedMs < VISION_FALLBACK_COOLDOWN_MS) return false
 
-        // Trigger on real Ad Activities or sparse/WebView/SurfaceView game canvases where Accessibility is blind
         return isRealAdActivity || hasWebViewOrSurface || visitedNodes <= SPARSE_TREE_NODE_THRESHOLD
     }
 
     @RequiresApi(Build.VERSION_CODES.R)
     private fun captureAndAnalyzeScreen(
         monitoredPackage: String,
-        isRealAdActivity: Boolean
+        isRealAdActivity: Boolean,
+        excludedRects: List<BoundsRect>
     ) {
         if (!isVisionScanInFlight.compareAndSet(false, true)) return
         lastVisionScanStartedMs = SystemClock.elapsedRealtime()
@@ -457,24 +529,39 @@ class SkipFlowAccessibilityService : AccessibilityService() {
                         var hardwareBitmap: Bitmap? = null
                         var softwareBitmap: Bitmap? = null
                         try {
-                            hardwareBitmap = Bitmap.wrapHardwareBuffer(hardwareBuffer, screenshot.colorSpace)
+                            // Android 16 / wide-gamut HardwareBuffer -> immediate ARGB_8888 Software Bitmap copy
+                            hardwareBitmap = runCatching {
+                                Bitmap.wrapHardwareBuffer(hardwareBuffer, screenshot.colorSpace)
+                            }.getOrNull() ?: Bitmap.wrapHardwareBuffer(hardwareBuffer, null)
+
                             softwareBitmap = hardwareBitmap?.copy(Bitmap.Config.ARGB_8888, false)
+                        } catch (_: Throwable) {
+                            softwareBitmap = null
                         } finally {
                             hardwareBitmap?.recycle()
                             runCatching { hardwareBuffer.close() }
                         }
 
                         if (softwareBitmap == null) {
+                            lastScreenshotStatus = "Fail(copy)"
+                            pushDebugOverlay(
+                                pkg = monitoredPackage,
+                                isAdScreen = isRealAdActivity,
+                                screenshotStatus = lastScreenshotStatus,
+                                detail = "فشل نسخ HardwareBitmap"
+                            )
                             isVisionScanInFlight.set(false)
                             return
                         }
 
+                        lastScreenshotStatus = "OK"
                         serviceScope.launch(Dispatchers.Default) {
                             try {
                                 analyzeSoftwareScreenshot(
                                     softwareBitmap = softwareBitmap,
                                     expectedPackage = monitoredPackage,
-                                    isRealAdActivity = isRealAdActivity
+                                    isRealAdActivity = isRealAdActivity,
+                                    excludedRects = excludedRects
                                 )
                             } finally {
                                 softwareBitmap.recycle()
@@ -484,11 +571,19 @@ class SkipFlowAccessibilityService : AccessibilityService() {
                     }
 
                     override fun onFailure(errorCode: Int) {
+                        lastScreenshotStatus = "Fail($errorCode)"
+                        pushDebugOverlay(
+                            pkg = monitoredPackage,
+                            isAdScreen = isRealAdActivity,
+                            screenshotStatus = lastScreenshotStatus,
+                            detail = if (errorCode == 6) "شاشة محمية SECURE" else "خطأ لقطة ($errorCode)"
+                        )
                         isVisionScanInFlight.set(false)
                     }
                 }
             )
         }.onFailure {
+            lastScreenshotStatus = "Fail(ex)"
             isVisionScanInFlight.set(false)
         }
     }
@@ -496,55 +591,130 @@ class SkipFlowAccessibilityService : AccessibilityService() {
     private suspend fun analyzeSoftwareScreenshot(
         softwareBitmap: Bitmap,
         expectedPackage: String,
-        isRealAdActivity: Boolean
+        isRealAdActivity: Boolean,
+        excludedRects: List<BoundsRect>
     ) {
         if (!isStillValidForVisionTap(expectedPackage)) return
 
         val (screenW, screenH, density) = getScreenMetrics()
         var targetBounds: BoundsRect? = null
         var targetType: AdTargetType = AdTargetType.GAME_AD_ICON
+        var detectedDetail = "لا يوجد تطابق"
+        var detectedAsAd = isRealAdActivity
 
-        // 1. Inside a confirmed AdActivity: run fast OpenCV Canny/Contours/HoughCircles corner detector first
+        // 1. Multi-Scale OpenCV Template Matching (`X` & `>>` at 0.7x, 1.0x, 1.3x, >= 0.65)
+        // Run directly in confirmed AdActivity, or after OCR confirms ad context.
+        var ocvMaxScore = 0.0
         if (isRealAdActivity) {
-            val iconHit = openCvAdIconDetector.detectCornerCloseIcon(
+            val ocvSummary = openCvAdIconDetector.detectCornerCloseIcon(
                 softwareScreenshot = softwareBitmap,
                 screenWidth = screenW,
                 screenHeight = screenH,
-                density = density
+                density = density,
+                excludedRects = excludedRects
             )
-            if (iconHit != null) {
-                targetBounds = iconHit.boundsOnScreen
+            ocvMaxScore = ocvSummary.maxScore
+            if (ocvSummary.detection != null) {
+                targetBounds = ocvSummary.detection.boundsOnScreen
                 targetType = AdTargetType.GAME_AD_ICON
+                detectedDetail = String.format(
+                    Locale.US,
+                    "OCV %s (%.2f)",
+                    ocvSummary.detection.shape.name,
+                    ocvSummary.detection.confidenceScore
+                )
             }
         }
 
-        // 2. Run offline Tesseract OCR (`ara+eng`) when OpenCV hasn't matched or outside explicit AdActivity
+        // 2. Dual Corner OCR (`X`, `>>`, `Skip`, `التخطي`) when OpenCV didn't trigger yet
+        if (targetBounds == null && isRealAdActivity) {
+            val cornerOcr = tesseractOcrEngine.recognizeCornerControls(
+                softwareScreenshot = softwareBitmap,
+                screenWidth = screenW,
+                screenHeight = screenH,
+                excludedRects = excludedRects
+            )
+            if (cornerOcr.actionTargetBounds != null) {
+                targetBounds = cornerOcr.actionTargetBounds
+                targetType = AdTargetType.GAME_AD_SKIP
+                detectedDetail = "CornerOCR: ${cornerOcr.matchedKeyword}"
+            }
+        }
+
+        // 3. Full-Screen Tesseract OCR (`ara+eng`) + OpenCV corner pass if OCR proves ad context
         if (targetBounds == null) {
             val ocrResult = tesseractOcrEngine.recognizeAdControls(
                 softwareScreenshot = softwareBitmap,
                 screenWidth = screenW,
                 screenHeight = screenH,
-                isRealAdActivity = isRealAdActivity
+                isRealAdActivity = isRealAdActivity,
+                excludedRects = excludedRects
             )
+            if (ocrResult.hasAdContext) {
+                detectedAsAd = true
+            }
+
             if (ocrResult.actionTargetBounds != null) {
                 targetBounds = ocrResult.actionTargetBounds
                 targetType = AdTargetType.GAME_AD_SKIP
+                detectedDetail = "OCR: ${ocrResult.matchedKeyword}"
             } else if (ocrResult.hasAdContext) {
-                // OCR confirmed ad keywords ("إعلان" / "اعرف المزيد") -> run OpenCV corner detector for X / >>
-                val iconHit = openCvAdIconDetector.detectCornerCloseIcon(
-                    softwareScreenshot = softwareBitmap,
-                    screenWidth = screenW,
-                    screenHeight = screenH,
-                    density = density
-                )
-                if (iconHit != null) {
-                    targetBounds = iconHit.boundsOnScreen
-                    targetType = AdTargetType.GAME_AD_ICON
+                if (!isRealAdActivity) {
+                    val ocvSummary = openCvAdIconDetector.detectCornerCloseIcon(
+                        softwareScreenshot = softwareBitmap,
+                        screenWidth = screenW,
+                        screenHeight = screenH,
+                        density = density,
+                        excludedRects = excludedRects
+                    )
+                    ocvMaxScore = maxOf(ocvMaxScore, ocvSummary.maxScore)
+                    if (ocvSummary.detection != null) {
+                        targetBounds = ocvSummary.detection.boundsOnScreen
+                        targetType = AdTargetType.GAME_AD_ICON
+                        detectedDetail = String.format(
+                            Locale.US,
+                            "OCV %s (%.2f)",
+                            ocvSummary.detection.shape.name,
+                            ocvSummary.detection.confidenceScore
+                        )
+                    } else {
+                        val cornerOcr = tesseractOcrEngine.recognizeCornerControls(
+                            softwareScreenshot = softwareBitmap,
+                            screenWidth = screenW,
+                            screenHeight = screenH,
+                            excludedRects = excludedRects
+                        )
+                        if (cornerOcr.actionTargetBounds != null) {
+                            targetBounds = cornerOcr.actionTargetBounds
+                            targetType = AdTargetType.GAME_AD_SKIP
+                            detectedDetail = "CornerOCR: ${cornerOcr.matchedKeyword}"
+                        } else {
+                            detectedDetail = String.format(Locale.US, "OCV=%.2f | بلا زر", ocvMaxScore)
+                        }
+                    }
+                } else {
+                    detectedDetail = String.format(Locale.US, "OCV=%.2f | OCR: بلا زر", ocvMaxScore)
+                }
+            } else {
+                detectedDetail = if (ocvMaxScore > 0.0) {
+                    String.format(Locale.US, "OCV=%.2f | ليس إعلاناً", ocvMaxScore)
+                } else {
+                    "ليست شاشة إعلان"
                 }
             }
         }
 
-        val resolvedBounds = targetBounds ?: return
+        val resolvedBounds = targetBounds
+        if (resolvedBounds == null) {
+            pushDebugOverlay(
+                pkg = expectedPackage,
+                isAdScreen = detectedAsAd,
+                screenshotStatus = "OK",
+                detail = detectedDetail
+            )
+            return
+        }
+
         if (!isStillValidForVisionTap(expectedPackage)) return
 
         withContext(Dispatchers.Main.immediate) {
@@ -558,11 +728,24 @@ class SkipFlowAccessibilityService : AccessibilityService() {
             )
             if (decision is StageDecision.ExecuteTap) {
                 playStoreRedirectGuard.recordGameOrAdSkipAttempt(expectedPackage, nowMs)
+                pushDebugOverlay(
+                    pkg = expectedPackage,
+                    isAdScreen = detectedAsAd,
+                    screenshotStatus = "OK",
+                    detail = "$detectedDetail -> ضغط"
+                )
                 dispatchCenterGesture(
                     bounds = resolvedBounds,
                     targetType = targetType,
                     stageNumber = decision.stageNumber,
                     countAsNewAdSkip = decision.countAsNewAdSkip
+                )
+            } else if (decision is StageDecision.Ignore) {
+                pushDebugOverlay(
+                    pkg = expectedPackage,
+                    isAdScreen = detectedAsAd,
+                    screenshotStatus = "OK",
+                    detail = "$detectedDetail (${decision.reason})"
                 )
             }
         }
@@ -578,10 +761,6 @@ class SkipFlowAccessibilityService : AccessibilityService() {
         return activeMonitoredPackage == expectedPackage
     }
 
-    /**
-     * Collects non-excluded TYPE_APPLICATION windows from service.windows (plus rootInActiveWindow)
-     * so game ad overlays displayed in separate windows are detected without ever scanning excluded apps.
-     */
     private fun collectAllApplicationWindowRoots(
         monitoredPackage: String,
         disabledPackages: Set<String>
@@ -670,7 +849,8 @@ class SkipFlowAccessibilityService : AccessibilityService() {
         val bestCandidate: CandidateMatch?,
         val hasYouTubeAdIndicator: Boolean,
         val visitedNodes: Int,
-        val hasWebViewOrSurface: Boolean
+        val hasWebViewOrSurface: Boolean,
+        val excludedRects: List<BoundsRect>
     )
 
     private fun scanWindowTree(
@@ -689,6 +869,7 @@ class SkipFlowAccessibilityService : AccessibilityService() {
         var hasWebViewOrSurface = rootIsWebView || (rootClass?.contains("SurfaceView", ignoreCase = true) == true)
         var bestCandidate: CandidateMatch? = null
         val cornerIconCandidates = mutableListOf<CornerIconCandidate>()
+        val excludedRects = mutableListOf<BoundsRect>()
         val tempRect = Rect()
         val isYouTube = monitoredPackage == AdDetectionRules.YOUTUBE_PACKAGE
 
@@ -715,6 +896,14 @@ class SkipFlowAccessibilityService : AccessibilityService() {
                 }
 
                 if (visible) {
+                    if (!isYouTube && AdDetectionRules.hasExcludedCornerKeyword(viewId, text, desc)) {
+                        node.getBoundsInScreen(tempRect)
+                        val exRect = BoundsRect(tempRect.left, tempRect.top, tempRect.right, tempRect.bottom)
+                        if (!exRect.isEmpty && exRect.width <= screenW * 0.4f && exRect.height <= screenH * 0.2f) {
+                            excludedRects.add(exRect)
+                        }
+                    }
+
                     val clickableSelfOrParent = node.isClickable || isAncestorClickable(node)
                     val targetType = AdDetectionRules.matchCandidate(
                         packageName = monitoredPackage,
@@ -803,7 +992,8 @@ class SkipFlowAccessibilityService : AccessibilityService() {
             bestCandidate = bestCandidate,
             hasYouTubeAdIndicator = hasYouTubeAd,
             visitedNodes = visitedNodes,
-            hasWebViewOrSurface = hasWebViewOrSurface
+            hasWebViewOrSurface = hasWebViewOrSurface,
+            excludedRects = excludedRects
         )
     }
 
@@ -1010,15 +1200,58 @@ class SkipFlowAccessibilityService : AccessibilityService() {
         if (settings.vibrateOnSkip) {
             performSubtleVibration()
         }
-        if (settings.toastOnSkip) {
-            val now = SystemClock.elapsedRealtime()
-            val message = when {
-                targetType == AdTargetType.YOUTUBE_POPUP_DISMISS -> "تم إغلاق نافذة يوتيوب المزعجة"
-                stageNumber > 1 -> "تم إغلاق المرحلة $stageNumber من الإعلان"
-                else -> "تم تخطي الإعلان تلقائياً"
-            }
-            showDebouncedToast(message, now)
+
+        val actionSummary = when {
+            targetType == AdTargetType.YOUTUBE_POPUP_DISMISS -> "تم إغلاق نافذة يوتيوب المزعجة"
+            stageNumber > 1 -> "تم إغلاق المرحلة $stageNumber من الإعلان"
+            else -> "تم تخطي الإعلان تلقائياً"
         }
+
+        val overlayRunning = settings.liveDebugOverlayEnabled && debugOverlayManager.canDrawOverlay()
+        if (overlayRunning) {
+            pushDebugOverlay(
+                pkg = activeMonitoredPackage,
+                isAdScreen = true,
+                screenshotStatus = lastScreenshotStatus,
+                detail = actionSummary
+            )
+        } else if (settings.toastOnSkip) {
+            showDebouncedToast(actionSummary, SystemClock.elapsedRealtime())
+        }
+    }
+
+    private fun emitStatusUpdate(
+        pkg: String?,
+        isAdScreen: Boolean,
+        screenshotStatus: String,
+        detail: String
+    ) {
+        val settings = repository.settings.value
+        val overlayRunning = settings.liveDebugOverlayEnabled && debugOverlayManager.canDrawOverlay()
+        if (overlayRunning) {
+            pushDebugOverlay(pkg, isAdScreen, screenshotStatus, detail)
+        } else if (settings.toastOnSkip) {
+            showDebouncedToast(detail, SystemClock.elapsedRealtime())
+        }
+    }
+
+    private fun pushDebugOverlay(
+        pkg: String?,
+        isAdScreen: Boolean,
+        screenshotStatus: String,
+        detail: String
+    ) {
+        lastDebugDetail = detail
+        val settings = repository.settings.value
+        val activityLabel = if (pkg == currentActivityPackage) currentActivityClassName else null
+        debugOverlayManager.updateStatus(
+            enabled = settings.engineEnabled && settings.liveDebugOverlayEnabled,
+            activityName = activityLabel,
+            packageName = pkg,
+            isAdScreen = isAdScreen,
+            screenshotStatus = screenshotStatus,
+            detail = detail
+        )
     }
 
     private fun showDebouncedToast(message: String, nowElapsed: Long) {
@@ -1108,7 +1341,7 @@ class SkipFlowAccessibilityService : AccessibilityService() {
         private const val WINDOW_STATE_SCAN_GAP_MS = 70L
         private const val COUNTDOWN_POLLING_INTERVAL_MS = 800L
         private const val POLLING_MIN_SCAN_GAP_MS = 650L
-        private const val VISION_FALLBACK_COOLDOWN_MS = 2_200L
+        private const val VISION_FALLBACK_COOLDOWN_MS = 1_800L
         private const val SPARSE_TREE_NODE_THRESHOLD = 25
         private const val TOAST_COOLDOWN_MS = 2_400L
 

@@ -21,6 +21,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.Undo
 import androidx.compose.material.icons.automirrored.rounded.VolumeOff
 import androidx.compose.material.icons.rounded.AutoAwesome
+import androidx.compose.material.icons.rounded.BugReport
 import androidx.compose.material.icons.rounded.Call
 import androidx.compose.material.icons.rounded.CloudDownload
 import androidx.compose.material.icons.rounded.NotificationsActive
@@ -66,6 +67,8 @@ fun SettingsScreen(
     onToastChanged: (Boolean) -> Unit,
     onPauseDuringCallsChanged: (Boolean) -> Unit,
     onBounceBackFromPlayStoreChanged: (Boolean) -> Unit,
+    onLiveDebugOverlayChanged: (Boolean) -> Unit,
+    onRequestOverlayPermission: () -> Unit,
     onCheckForUpdates: () -> Unit,
     onDownloadUpdate: (GitHubReleaseInfo) -> Unit,
     onInstallApk: (File) -> Unit,
@@ -156,6 +159,37 @@ fun SettingsScreen(
                     checked = uiState.settings.bounceBackFromPlayStore,
                     onCheckedChange = onBounceBackFromPlayStoreChanged
                 )
+
+                HorizontalDivider(color = SkipFlowColors.NavyBorder.copy(alpha = 0.6f))
+
+                SettingsToggleRow(
+                    icon = Icons.Rounded.BugReport,
+                    title = "شريط التشخيص الحي فوق الشاشة",
+                    subtitle = if (uiState.canDrawOverlays) {
+                        "عرض سطر حي أعلى الشاشة لحالة النشاط ولقطة الشاشة والتعرف البصري (بدل Toast)"
+                    } else {
+                        "يتطلب إذن الظهور فوق التطبيقات (SYSTEM_ALERT_WINDOW) لعرض الشريط الحي"
+                    },
+                    checked = uiState.settings.liveDebugOverlayEnabled,
+                    onCheckedChange = onLiveDebugOverlayChanged
+                )
+
+                if (uiState.settings.liveDebugOverlayEnabled && !uiState.canDrawOverlays) {
+                    OutlinedButton(
+                        onClick = onRequestOverlayPermission,
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(12.dp),
+                        border = BorderStroke(1.dp, SkipFlowColors.WarningAmber.copy(alpha = 0.7f)),
+                        contentPadding = PaddingValues(vertical = 8.dp)
+                    ) {
+                        Text(
+                            text = "منح إذن الظهور فوق التطبيقات الآن",
+                            color = SkipFlowColors.WarningAmber,
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+                }
             }
         }
 

@@ -4,141 +4,87 @@ import android.graphics.Bitmap
 import com.max.skipflow.engine.BoundsRect
 import org.opencv.android.OpenCVLoader
 import org.opencv.android.Utils
+import org.opencv.core.Core
+import org.opencv.core.CvType
 import org.opencv.core.Mat
-import org.opencv.core.MatOfPoint
+import org.opencv.core.Point
 import org.opencv.core.Rect as CvRect
+import org.opencv.core.Scalar
 import org.opencv.core.Size
 import org.opencv.imgproc.Imgproc
 import kotlin.math.abs
-import kotlin.math.atan2
 
 enum class DetectedIconShape {
     CROSS_X,
     DOUBLE_CHEVRON
 }
 
-data class LineSegment2D(
-    val x1: Float,
-    val y1: Float,
-    val x2: Float,
-    val y2: Float
-)
-
 data class VisualIconDetection(
     val boundsOnScreen: BoundsRect,
     val centerX: Float,
     val centerY: Float,
     val shape: DetectedIconShape,
-    val confidenceScore: Int
+    val confidenceScore: Double
+)
+
+data class OpenCvCornerScanSummary(
+    val detection: VisualIconDetection?,
+    val maxScore: Double
 )
 
 /**
- * Pure JVM-testable geometric classifier that identifies crossing diagonal lines (`X`)
- * or double-arrow chevrons (`>>`) inside a small candidate button ROI.
+ * Pure JVM-testable helper for multi-scale template matching coordinate mapping
+ * and audio/info exclusion filtering.
  */
-object OpenCvShapeClassifier {
+object OpenCvTemplateEvaluator {
 
-    fun classifyLines(
-        segments: List<LineSegment2D>,
-        roiWidth: Int,
-        roiHeight: Int
-    ): DetectedIconShape? {
-        if (segments.size < 2 || roiWidth <= 0 || roiHeight <= 0) return null
+    const val MATCH_THRESHOLD = 0.65
+    val SCALES = floatArrayOf(0.7f, 1.0f, 1.3f)
 
-        val minLength = minOf(roiWidth, roiHeight) * 0.16f
-        val positiveDiagonals = mutableListOf<LineSegment2D>()
-        val negativeDiagonals = mutableListOf<LineSegment2D>()
-
-        for (seg in segments) {
-            val dx = seg.x2 - seg.x1
-            val dy = seg.y2 - seg.y1
-            val len = kotlin.math.hypot(dx.toDouble(), dy.toDouble()).toFloat()
-            if (len < minLength) continue
-
-            var angleDeg = Math.toDegrees(atan2(dy.toDouble(), dx.toDouble())).toFloat()
-            if (angleDeg > 90f) angleDeg -= 180f
-            if (angleDeg < -90f) angleDeg += 180f
-
-            // Diagonal slopes around 22..72 degrees (covers X and > / >> chevrons)
-            if (angleDeg in 22f..72f) {
-                positiveDiagonals.add(seg)
-            } else if (angleDeg in -72f..-22f) {
-                negativeDiagonals.add(seg)
+    fun isInsideExcludedRect(
+        centerX: Float,
+        centerY: Float,
+        excludedRects: List<BoundsRect>,
+        paddingPx: Int = 14
+    ): Boolean {
+        for (rect in excludedRects) {
+            if (centerX >= rect.left - paddingPx &&
+                centerX <= rect.right + paddingPx &&
+                centerY >= rect.top - paddingPx &&
+                centerY <= rect.bottom + paddingPx
+            ) {
+                return true
             }
         }
-
-        if (positiveDiagonals.isEmpty() || negativeDiagonals.isEmpty()) {
-            return null
-        }
-
-        // Check for crossing diagonals near center -> `X` icon
-        val centerX = roiWidth / 2f
-        val centerY = roiHeight / 2f
-        val centerTolX = roiWidth * 0.35f
-        val centerTolY = roiHeight * 0.35f
-
-        for (pos in positiveDiagonals) {
-            for (neg in negativeDiagonals) {
-                if (segmentsIntersectNear(pos, neg, centerX, centerY, centerTolX, centerTolY)) {
-                    return DetectedIconShape.CROSS_X
-                }
-            }
-        }
-
-        // Check for double chevrons (`>>`) arranged horizontally across left and right halves
-        if (positiveDiagonals.size >= 2 && negativeDiagonals.size >= 2) {
-            val leftHalfHasChevron = hasChevronPairInXRange(positiveDiagonals, negativeDiagonals, 0f, roiWidth * 0.58f)
-            val rightHalfHasChevron = hasChevronPairInXRange(positiveDiagonals, negativeDiagonals, roiWidth * 0.42f, roiWidth.toFloat())
-            if (leftHalfHasChevron && rightHalfHasChevron) {
-                return DetectedIconShape.DOUBLE_CHEVRON
-            }
-        }
-
-        return null
+        return false
     }
 
-    private fun hasChevronPairInXRange(
-        posList: List<LineSegment2D>,
-        negList: List<LineSegment2D>,
-        minX: Float,
-        maxX: Float
-    ): Boolean {
-        val posInBand = posList.any { ((it.x1 + it.x2) / 2f) in minX..maxX }
-        val negInBand = negList.any { ((it.x1 + it.x2) / 2f) in minX..maxX }
-        return posInBand && negInBand
-    }
-
-    private fun segmentsIntersectNear(
-        a: LineSegment2D,
-        b: LineSegment2D,
-        targetX: Float,
-        targetY: Float,
-        tolX: Float,
-        tolY: Float
-    ): Boolean {
-        val denom = (a.x1 - a.x2) * (b.y1 - b.y2) - (a.y1 - a.y2) * (b.x1 - b.x2)
-        if (abs(denom) < 1e-3f) return false
-
-        val t = ((a.x1 - b.x1) * (b.y1 - b.y2) - (a.y1 - b.y1) * (b.x1 - b.x2)) / denom
-        val u = -((a.x1 - a.x2) * (a.y1 - b.y1) - (a.y1 - a.y2) * (a.x1 - b.x1)) / denom
-        // True crossing X lines intersect in the interior of both segments (not at chevron endpoints)
-        if (t !in 0.20f..0.80f || u !in 0.20f..0.80f) return false
-
-        val ix = a.x1 + t * (a.x2 - a.x1)
-        val iy = a.y1 + t * (a.y2 - a.y1)
-        return abs(ix - targetX) <= tolX && abs(iy - targetY) <= tolY
+    fun selectBestMatch(
+        candidates: List<VisualIconDetection>,
+        excludedRects: List<BoundsRect>
+    ): VisualIconDetection? {
+        return candidates
+            .filter { it.confidenceScore >= MATCH_THRESHOLD }
+            .filterNot { isInsideExcludedRect(it.centerX, it.centerY, excludedRects) }
+            .maxByOrNull { it.confidenceScore }
     }
 }
 
 /**
- * Uses OpenCV (Canny Edge Detection + findContours + HoughCircles + HoughLinesP)
- * on the top-left (20% x 15%) and top-right (20% x 15%) crops of a screenshot
- * to locate small circular or square `X` / `>>` close buttons (20dp to 75dp).
+ * Multi-scale OpenCV Template Matching (`TM_CCOEFF_NORMED`) detector using programmatically
+ * generated white-on-dark/gray `X` and `>>` templates at scales 0.7x, 1.0x, and 1.3x
+ * across the top-left (22% x 15%) and top-right (22% x 15%) screen corners.
  */
 class OpenCvAdIconDetector {
 
+    private data class TemplateSpec(
+        val shape: DetectedIconShape,
+        val mat: Mat
+    )
+
     @Volatile
     private var openCvLoaded: Boolean = false
+    private var cachedTemplates: List<TemplateSpec>? = null
 
     fun ensureInitialized(): Boolean {
         if (openCvLoaded) return true
@@ -151,24 +97,28 @@ class OpenCvAdIconDetector {
         softwareScreenshot: Bitmap,
         screenWidth: Int,
         screenHeight: Int,
-        density: Float
-    ): VisualIconDetection? {
-        if (!ensureInitialized()) return null
+        density: Float,
+        excludedRects: List<BoundsRect> = emptyList()
+    ): OpenCvCornerScanSummary {
+        if (!ensureInitialized()) return OpenCvCornerScanSummary(null, 0.0)
         if (softwareScreenshot.isRecycled || softwareScreenshot.width <= 0 || softwareScreenshot.height <= 0) {
-            return null
+            return OpenCvCornerScanSummary(null, 0.0)
         }
-        if (screenWidth <= 0 || screenHeight <= 0 || density <= 0f) return null
+        if (screenWidth <= 0 || screenHeight <= 0 || density <= 0f) {
+            return OpenCvCornerScanSummary(null, 0.0)
+        }
+
+        val templates = getOrCreateTemplates()
+        if (templates.isEmpty()) return OpenCvCornerScanSummary(null, 0.0)
 
         val bmpW = softwareScreenshot.width
         val bmpH = softwareScreenshot.height
-        val scaleX = bmpW.toFloat() / screenWidth.toFloat()
-        val scaleY = bmpH.toFloat() / screenHeight.toFloat()
+        val scaleToBmpX = bmpW.toFloat() / screenWidth.toFloat()
+        val scaleToBmpY = bmpH.toFloat() / screenHeight.toFloat()
 
-        val cropW = (bmpW * CORNER_WIDTH_RATIO).toInt().coerceAtLeast(32)
-        val cropH = (bmpH * CORNER_HEIGHT_RATIO).toInt().coerceAtLeast(32)
-
-        val minSizePx = (MIN_BUTTON_DP * density * scaleX).toInt().coerceAtLeast(16)
-        val maxSizePx = (MAX_BUTTON_DP * density * scaleX).toInt().coerceAtLeast(minSizePx + 8)
+        val cropW = (bmpW * CORNER_WIDTH_RATIO).toInt().coerceAtLeast(48)
+        val cropH = (bmpH * CORNER_HEIGHT_RATIO).toInt().coerceAtLeast(48)
+        val baseSizePx = (BASE_TEMPLATE_DP * density * scaleToBmpX).coerceIn(24f, cropW * 0.75f)
 
         val fullMat = Mat()
         return try {
@@ -178,188 +128,230 @@ class OpenCvAdIconDetector {
             val topRightX = (bmpW - cropW).coerceAtLeast(0)
             val topRightCrop = CvRect(topRightX, 0, (bmpW - topRightX).coerceAtLeast(1), cropH.coerceAtMost(bmpH))
 
-            val candidates = mutableListOf<VisualIconDetection>()
-            inspectCornerCrop(
-                fullMat = fullMat,
-                cropRect = topLeftCrop,
-                minSizePx = minSizePx,
-                maxSizePx = maxSizePx,
-                scaleX = scaleX,
-                scaleY = scaleY,
-                out = candidates
+            val detections = mutableListOf<VisualIconDetection>()
+            var highestScore = 0.0
+
+            highestScore = maxOf(
+                highestScore,
+                matchTemplatesInCorner(
+                    fullMat = fullMat,
+                    cropRect = topLeftCrop,
+                    templates = templates,
+                    baseSizePx = baseSizePx,
+                    scaleToBmpX = scaleToBmpX,
+                    scaleToBmpY = scaleToBmpY,
+                    excludedRects = excludedRects,
+                    out = detections
+                )
             )
-            inspectCornerCrop(
-                fullMat = fullMat,
-                cropRect = topRightCrop,
-                minSizePx = minSizePx,
-                maxSizePx = maxSizePx,
-                scaleX = scaleX,
-                scaleY = scaleY,
-                out = candidates
+            highestScore = maxOf(
+                highestScore,
+                matchTemplatesInCorner(
+                    fullMat = fullMat,
+                    cropRect = topRightCrop,
+                    templates = templates,
+                    baseSizePx = baseSizePx,
+                    scaleToBmpX = scaleToBmpX,
+                    scaleToBmpY = scaleToBmpY,
+                    excludedRects = excludedRects,
+                    out = detections
+                )
             )
 
-            candidates.maxByOrNull { it.confidenceScore }
+            val winner = OpenCvTemplateEvaluator.selectBestMatch(detections, excludedRects)
+            OpenCvCornerScanSummary(
+                detection = winner,
+                maxScore = highestScore
+            )
         } catch (_: Throwable) {
-            null
+            OpenCvCornerScanSummary(null, 0.0)
         } finally {
             fullMat.release()
         }
     }
 
-    private fun inspectCornerCrop(
+    private fun matchTemplatesInCorner(
         fullMat: Mat,
         cropRect: CvRect,
-        minSizePx: Int,
-        maxSizePx: Int,
-        scaleX: Float,
-        scaleY: Float,
+        templates: List<TemplateSpec>,
+        baseSizePx: Float,
+        scaleToBmpX: Float,
+        scaleToBmpY: Float,
+        excludedRects: List<BoundsRect>,
         out: MutableList<VisualIconDetection>
-    ) {
+    ): Double {
         val roiMat = Mat(fullMat, cropRect)
-        val gray = Mat()
-        val blurred = Mat()
-        val edges = Mat()
-        val hierarchy = Mat()
-        val circles = Mat()
-        val contours = mutableListOf<MatOfPoint>()
+        val cropGray = Mat()
+        val cropInv = Mat()
+        var bestCornerScore = 0.0
 
         try {
-            Imgproc.cvtColor(roiMat, gray, Imgproc.COLOR_RGBA2GRAY)
-            Imgproc.GaussianBlur(gray, blurred, Size(3.0, 3.0), 0.0)
-            Imgproc.Canny(blurred, edges, 55.0, 155.0)
+            Imgproc.cvtColor(roiMat, cropGray, Imgproc.COLOR_RGBA2GRAY)
+            Core.bitwise_not(cropGray, cropInv)
 
-            val candidateBoxes = mutableListOf<Pair<CvRect, Int>>()
+            for (spec in templates) {
+                val aspect = spec.mat.cols().toFloat() / spec.mat.rows().toFloat().coerceAtLeast(1f)
+                for (scale in OpenCvTemplateEvaluator.SCALES) {
+                    val targetH = (baseSizePx * scale).toInt()
+                    val targetW = (targetH * aspect).toInt()
+                    if (targetW < 14 || targetH < 14) continue
+                    if (targetW >= cropGray.cols() - 2 || targetH >= cropGray.rows() - 2) continue
 
-            // 1. Detect circular close/skip badges via HoughCircles
-            val minRadius = (minSizePx / 2).coerceAtLeast(8)
-            val maxRadius = (maxSizePx / 2).coerceAtLeast(minRadius + 4)
-            Imgproc.HoughCircles(
-                blurred,
-                circles,
-                Imgproc.HOUGH_GRADIENT,
-                1.0,
-                minSizePx.toDouble(),
-                120.0,
-                26.0,
-                minRadius,
-                maxRadius
-            )
-            for (i in 0 until circles.cols()) {
-                val data = circles.get(0, i) ?: continue
-                if (data.size < 3) continue
-                val cx = data[0].toInt()
-                val cy = data[1].toInt()
-                val r = data[2].toInt()
-                val left = (cx - r).coerceAtLeast(0)
-                val top = (cy - r).coerceAtLeast(0)
-                val right = (cx + r).coerceAtMost(edges.cols())
-                val bottom = (cy + r).coerceAtMost(edges.rows())
-                val w = right - left
-                val h = bottom - top
-                if (w in minSizePx..maxSizePx && h in minSizePx..maxSizePx) {
-                    candidateBoxes.add(CvRect(left, top, w, h) to 20)
-                }
-            }
+                    val scaledTemplate = Mat()
+                    val resultNormal = Mat()
+                    val resultInv = Mat()
+                    try {
+                        Imgproc.resize(
+                            spec.mat,
+                            scaledTemplate,
+                            Size(targetW.toDouble(), targetH.toDouble()),
+                            0.0,
+                            0.0,
+                            Imgproc.INTER_AREA
+                        )
 
-            // 2. Detect square / rounded-rect close/skip buttons via findContours
-            Imgproc.findContours(
-                edges.clone(),
-                contours,
-                hierarchy,
-                Imgproc.RETR_TREE,
-                Imgproc.CHAIN_APPROX_SIMPLE
-            )
-            for (contour in contours) {
-                val rect = Imgproc.boundingRect(contour)
-                if (rect.width in minSizePx..maxSizePx && rect.height in minSizePx..maxSizePx) {
-                    val ratio = rect.width.toFloat() / rect.height.toFloat().coerceAtLeast(1f)
-                    if (ratio in 0.65f..1.65f) {
-                        candidateBoxes.add(rect to 10)
+                        // Check white-on-dark polarity
+                        Imgproc.matchTemplate(cropGray, scaledTemplate, resultNormal, Imgproc.TM_CCOEFF_NORMED)
+                        val mmrNormal = Core.minMaxLoc(resultNormal)
+                        bestCornerScore = maxOf(bestCornerScore, mmrNormal.maxVal)
+                        if (mmrNormal.maxVal >= OpenCvTemplateEvaluator.MATCH_THRESHOLD) {
+                            addDetectionIfNotExcluded(
+                                loc = mmrNormal.maxLoc,
+                                score = mmrNormal.maxVal,
+                                targetW = targetW,
+                                targetH = targetH,
+                                cropRect = cropRect,
+                                scaleToBmpX = scaleToBmpX,
+                                scaleToBmpY = scaleToBmpY,
+                                shape = spec.shape,
+                                excludedRects = excludedRects,
+                                out = out
+                            )
+                        }
+
+                        // Check dark-on-light polarity (light-theme end-card close buttons)
+                        Imgproc.matchTemplate(cropInv, scaledTemplate, resultInv, Imgproc.TM_CCOEFF_NORMED)
+                        val mmrInv = Core.minMaxLoc(resultInv)
+                        bestCornerScore = maxOf(bestCornerScore, mmrInv.maxVal)
+                        if (mmrInv.maxVal >= OpenCvTemplateEvaluator.MATCH_THRESHOLD) {
+                            addDetectionIfNotExcluded(
+                                loc = mmrInv.maxLoc,
+                                score = mmrInv.maxVal,
+                                targetW = targetW,
+                                targetH = targetH,
+                                cropRect = cropRect,
+                                scaleToBmpX = scaleToBmpX,
+                                scaleToBmpY = scaleToBmpY,
+                                shape = spec.shape,
+                                excludedRects = excludedRects,
+                                out = out
+                            )
+                        }
+                    } finally {
+                        resultInv.release()
+                        resultNormal.release()
+                        scaledTemplate.release()
                     }
                 }
             }
-
-            // 3. Verify inner glyph (`X` crossing lines or `>>` double chevrons) inside each candidate box
-            for ((box, baseScore) in candidateBoxes) {
-                val insetX = (box.width * 0.14f).toInt().coerceAtLeast(1)
-                val insetY = (box.height * 0.14f).toInt().coerceAtLeast(1)
-                val innerLeft = (box.x + insetX).coerceIn(0, edges.cols() - 1)
-                val innerTop = (box.y + insetY).coerceIn(0, edges.rows() - 1)
-                val innerRight = (box.x + box.width - insetX).coerceIn(innerLeft + 1, edges.cols())
-                val innerBottom = (box.y + box.height - insetY).coerceIn(innerTop + 1, edges.rows())
-                val innerRect = CvRect(innerLeft, innerTop, innerRight - innerLeft, innerBottom - innerTop)
-                if (innerRect.width < 8 || innerRect.height < 8) continue
-
-                val detectedShape = classifyButtonInnerGlyph(edges, innerRect) ?: continue
-
-                val absLeft = ((cropRect.x + box.x) / scaleX).toInt()
-                val absTop = ((cropRect.y + box.y) / scaleY).toInt()
-                val absRight = ((cropRect.x + box.x + box.width) / scaleX).toInt()
-                val absBottom = ((cropRect.y + box.y + box.height) / scaleY).toInt()
-                val screenBounds = BoundsRect(absLeft, absTop, absRight, absBottom)
-                val shapeBonus = if (detectedShape == DetectedIconShape.CROSS_X) 15 else 12
-
-                out.add(
-                    VisualIconDetection(
-                        boundsOnScreen = screenBounds,
-                        centerX = screenBounds.centerX.toFloat(),
-                        centerY = screenBounds.centerY.toFloat(),
-                        shape = detectedShape,
-                        confidenceScore = baseScore + shapeBonus
-                    )
-                )
-            }
         } finally {
-            contours.forEach { it.release() }
-            circles.release()
-            hierarchy.release()
-            edges.release()
-            blurred.release()
-            gray.release()
+            cropInv.release()
+            cropGray.release()
             roiMat.release()
+        }
+        return bestCornerScore
+    }
+
+    private fun addDetectionIfNotExcluded(
+        loc: Point,
+        score: Double,
+        targetW: Int,
+        targetH: Int,
+        cropRect: CvRect,
+        scaleToBmpX: Float,
+        scaleToBmpY: Float,
+        shape: DetectedIconShape,
+        excludedRects: List<BoundsRect>,
+        out: MutableList<VisualIconDetection>
+    ) {
+        val absLeft = ((cropRect.x + loc.x) / scaleToBmpX).toInt()
+        val absTop = ((cropRect.y + loc.y) / scaleToBmpY).toInt()
+        val absRight = ((cropRect.x + loc.x + targetW) / scaleToBmpX).toInt()
+        val absBottom = ((cropRect.y + loc.y + targetH) / scaleToBmpY).toInt()
+        val bounds = BoundsRect(absLeft, absTop, absRight, absBottom)
+        val cx = bounds.centerX.toFloat()
+        val cy = bounds.centerY.toFloat()
+
+        if (!OpenCvTemplateEvaluator.isInsideExcludedRect(cx, cy, excludedRects)) {
+            out.add(
+                VisualIconDetection(
+                    boundsOnScreen = bounds,
+                    centerX = cx,
+                    centerY = cy,
+                    shape = shape,
+                    confidenceScore = score
+                )
+            )
         }
     }
 
-    private fun classifyButtonInnerGlyph(edges: Mat, innerRect: CvRect): DetectedIconShape? {
-        val innerMat = Mat(edges, innerRect)
-        val linesMat = Mat()
-        return try {
-            val minLen = (minOf(innerRect.width, innerRect.height) * 0.22).coerceAtLeast(4.0)
-            val threshold = (minOf(innerRect.width, innerRect.height) * 0.18).toInt().coerceAtLeast(6)
-            Imgproc.HoughLinesP(
-                innerMat,
-                linesMat,
-                1.0,
-                Math.PI / 180.0,
-                threshold,
-                minLen,
-                4.0
-            )
-            val segments = ArrayList<LineSegment2D>(linesMat.rows())
-            for (i in 0 until linesMat.rows()) {
-                val vec = linesMat.get(i, 0) ?: continue
-                if (vec.size >= 4) {
-                    segments.add(
-                        LineSegment2D(
-                            x1 = vec[0].toFloat(),
-                            y1 = vec[1].toFloat(),
-                            x2 = vec[2].toFloat(),
-                            y2 = vec[3].toFloat()
-                        )
-                    )
-                }
-            }
-            OpenCvShapeClassifier.classifyLines(segments, innerRect.width, innerRect.height)
-        } finally {
-            linesMat.release()
-            innerMat.release()
-        }
+    @Synchronized
+    private fun getOrCreateTemplates(): List<TemplateSpec> {
+        cachedTemplates?.let { return it }
+        val built = listOf(
+            TemplateSpec(DetectedIconShape.CROSS_X, createCircleXTemplate()),
+            TemplateSpec(DetectedIconShape.CROSS_X, createPlainXTemplate()),
+            TemplateSpec(DetectedIconShape.DOUBLE_CHEVRON, createCircleDoubleChevronTemplate()),
+            TemplateSpec(DetectedIconShape.DOUBLE_CHEVRON, createPlainDoubleChevronTemplate())
+        )
+        cachedTemplates = built
+        return built
+    }
+
+    private fun createCircleXTemplate(): Mat {
+        val mat = Mat(64, 64, CvType.CV_8UC1, Scalar(75.0))
+        Imgproc.circle(mat, Point(32.0, 32.0), 27, Scalar(28.0), -1, Imgproc.LINE_AA, 0)
+        Imgproc.line(mat, Point(20.0, 20.0), Point(44.0, 44.0), Scalar(255.0), 4, Imgproc.LINE_AA, 0)
+        Imgproc.line(mat, Point(44.0, 20.0), Point(20.0, 44.0), Scalar(255.0), 4, Imgproc.LINE_AA, 0)
+        return mat
+    }
+
+    private fun createPlainXTemplate(): Mat {
+        val mat = Mat(48, 48, CvType.CV_8UC1, Scalar(35.0))
+        Imgproc.line(mat, Point(10.0, 10.0), Point(38.0, 38.0), Scalar(255.0), 4, Imgproc.LINE_AA, 0)
+        Imgproc.line(mat, Point(38.0, 10.0), Point(10.0, 38.0), Scalar(255.0), 4, Imgproc.LINE_AA, 0)
+        return mat
+    }
+
+    private fun createCircleDoubleChevronTemplate(): Mat {
+        val mat = Mat(64, 64, CvType.CV_8UC1, Scalar(75.0))
+        Imgproc.circle(mat, Point(32.0, 32.0), 27, Scalar(28.0), -1, Imgproc.LINE_AA, 0)
+        // First '>'
+        Imgproc.line(mat, Point(16.0, 21.0), Point(29.0, 32.0), Scalar(255.0), 4, Imgproc.LINE_AA, 0)
+        Imgproc.line(mat, Point(29.0, 32.0), Point(16.0, 43.0), Scalar(255.0), 4, Imgproc.LINE_AA, 0)
+        // Second '>'
+        Imgproc.line(mat, Point(33.0, 21.0), Point(46.0, 32.0), Scalar(255.0), 4, Imgproc.LINE_AA, 0)
+        Imgproc.line(mat, Point(46.0, 32.0), Point(33.0, 43.0), Scalar(255.0), 4, Imgproc.LINE_AA, 0)
+        return mat
+    }
+
+    private fun createPlainDoubleChevronTemplate(): Mat {
+        val mat = Mat(44, 56, CvType.CV_8UC1, Scalar(35.0))
+        Imgproc.line(mat, Point(10.0, 10.0), Point(24.0, 22.0), Scalar(255.0), 4, Imgproc.LINE_AA, 0)
+        Imgproc.line(mat, Point(24.0, 22.0), Point(10.0, 34.0), Scalar(255.0), 4, Imgproc.LINE_AA, 0)
+        Imgproc.line(mat, Point(29.0, 10.0), Point(43.0, 22.0), Scalar(255.0), 4, Imgproc.LINE_AA, 0)
+        Imgproc.line(mat, Point(43.0, 22.0), Point(29.0, 34.0), Scalar(255.0), 4, Imgproc.LINE_AA, 0)
+        return mat
+    }
+
+    fun release() {
+        cachedTemplates?.forEach { it.mat.release() }
+        cachedTemplates = null
     }
 
     companion object {
-        private const val CORNER_WIDTH_RATIO = 0.20f
-        private const val CORNER_HEIGHT_RATIO = 0.15f
-        private const val MIN_BUTTON_DP = 20f
-        private const val MAX_BUTTON_DP = 75f
+        const val CORNER_WIDTH_RATIO = 0.22f
+        const val CORNER_HEIGHT_RATIO = 0.15f
+        private const val BASE_TEMPLATE_DP = 36f
     }
 }

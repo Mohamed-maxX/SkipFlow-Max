@@ -20,8 +20,8 @@ data class OcrAdScanResult(
 )
 
 /**
- * Pure JVM-testable matcher over OCR lines/words for Arabic & English ad skip controls
- * and ad-context keywords.
+ * Pure JVM-testable matcher over OCR lines/words for Arabic & English ad skip controls,
+ * corner glyph text (`X`, `>>`, `Skip`, `التخطي`), and ad-context keywords.
  */
 object OcrAdTextMatcher {
 
@@ -42,6 +42,19 @@ object OcrAdTextMatcher {
         "continue"
     )
 
+    private val cornerDualGlyphKeywords = listOf(
+        "التخطي",
+        "تخطي",
+        "إغلاق",
+        "اغلاق",
+        "skip",
+        "close",
+        ">>",
+        "×",
+        "✕",
+        "✖"
+    )
+
     private val adContextKeywords = listOf(
         "إعلان",
         "اعلان",
@@ -58,7 +71,8 @@ object OcrAdTextMatcher {
         observations: List<OcrObservation>,
         screenWidth: Int,
         screenHeight: Int,
-        isRealAdActivity: Boolean
+        isRealAdActivity: Boolean,
+        excludedRects: List<BoundsRect> = emptyList()
     ): OcrAdScanResult {
         if (observations.isEmpty() || screenWidth <= 0 || screenHeight <= 0) {
             return OcrAdScanResult(null, null, hasAdContext = isRealAdActivity)
@@ -79,6 +93,14 @@ object OcrAdTextMatcher {
             if (AdDetectionRules.isCountdownText(norm)) continue
             if (!isPlausibleButtonBox(obs.bounds, screenWidth, screenHeight)) continue
             if (AdDetectionRules.hasExcludedCornerKeyword(null, norm, null)) continue
+            if (OpenCvTemplateEvaluator.isInsideExcludedRect(
+                    obs.bounds.centerX.toFloat(),
+                    obs.bounds.centerY.toFloat(),
+                    excludedRects
+                )
+            ) {
+                continue
+            }
 
             val highMatch = highPriorityActionKeywords.firstOrNull { norm.contains(it, ignoreCase = true) }
             if (highMatch != null && bestHighPriority == null) {
@@ -100,6 +122,42 @@ object OcrAdTextMatcher {
         )
     }
 
+    fun evaluateCornerObservations(
+        observations: List<OcrObservation>,
+        screenWidth: Int,
+        screenHeight: Int,
+        excludedRects: List<BoundsRect> = emptyList()
+    ): OcrAdScanResult {
+        if (observations.isEmpty() || screenWidth <= 0 || screenHeight <= 0) {
+            return OcrAdScanResult(null, null, hasAdContext = false)
+        }
+
+        for (obs in observations) {
+            if (obs.confidence in 1f..30f) continue
+            val norm = AdDetectionRules.normalizeText(obs.text, maxLength = 32) ?: continue
+            if (AdDetectionRules.isCountdownText(norm)) continue
+            if (AdDetectionRules.hasExcludedCornerKeyword(null, norm, null)) continue
+            if (!isPlausibleButtonBox(obs.bounds, screenWidth, screenHeight)) continue
+            if (OpenCvTemplateEvaluator.isInsideExcludedRect(
+                    obs.bounds.centerX.toFloat(),
+                    obs.bounds.centerY.toFloat(),
+                    excludedRects
+                )
+            ) {
+                continue
+            }
+
+            if (norm == "x") {
+                return OcrAdScanResult(obs.bounds, "X", hasAdContext = true)
+            }
+            val matched = cornerDualGlyphKeywords.firstOrNull { norm.contains(it, ignoreCase = true) }
+            if (matched != null) {
+                return OcrAdScanResult(obs.bounds, matched, hasAdContext = true)
+            }
+        }
+        return OcrAdScanResult(null, null, hasAdContext = false)
+    }
+
     private fun isAdContextText(normalized: String): Boolean {
         if (adContextKeywords.any { normalized.contains(it, ignoreCase = true) }) {
             return true
@@ -113,7 +171,7 @@ object OcrAdTextMatcher {
         screenHeight: Int
     ): Boolean {
         if (bounds.isEmpty) return false
-        if (bounds.width < 12 || bounds.height < 12) return false
+        if (bounds.width < 10 || bounds.height < 10) return false
         if (bounds.width > screenWidth * 0.75f || bounds.height > screenHeight * 0.16f) return false
         return bounds.centerX in 2..(screenWidth - 2) && bounds.centerY in 2..(screenHeight - 2)
     }
@@ -121,7 +179,7 @@ object OcrAdTextMatcher {
 
 /**
  * Offline Arabic + English (`ara+eng`) OCR engine powered by Tesseract4Android.
- * Used as a fallback when regular Accessibility tree inspection finds no skip/close button.
+ * Scans both full screenshots and zoomed top-corner crops (`X`, `>>`, `Skip`, `التخطي`).
  */
 class TesseractOcrEngine(
     private val tessDataManager: TessDataManager
@@ -134,7 +192,8 @@ class TesseractOcrEngine(
         softwareScreenshot: Bitmap,
         screenWidth: Int,
         screenHeight: Int,
-        isRealAdActivity: Boolean
+        isRealAdActivity: Boolean,
+        excludedRects: List<BoundsRect> = emptyList()
     ): OcrAdScanResult = tessMutex.withLock {
         if (softwareScreenshot.isRecycled || softwareScreenshot.width <= 0 || softwareScreenshot.height <= 0) {
             return@withLock OcrAdScanResult(null, null, hasAdContext = isRealAdActivity)
@@ -162,40 +221,21 @@ class TesseractOcrEngine(
             val scaleToScreenX = screenWidth.toFloat() / targetBitmap.width.toFloat()
             val scaleToScreenY = screenHeight.toFloat() / targetBitmap.height.toFloat()
 
-            api.setImage(targetBitmap)
-            // Trigger recognition before iterating bounding boxes
-            api.getUTF8Text()
-
-            val observations = mutableListOf<OcrObservation>()
-            val iterator = api.resultIterator
-            if (iterator != null) {
-                try {
-                    collectLevelObservations(
-                        iterator = iterator,
-                        level = TessBaseAPI.PageIteratorLevel.RIL_TEXTLINE,
-                        scaleX = scaleToScreenX,
-                        scaleY = scaleToScreenY,
-                        out = observations
-                    )
-                    collectLevelObservations(
-                        iterator = iterator,
-                        level = TessBaseAPI.PageIteratorLevel.RIL_WORD,
-                        scaleX = scaleToScreenX,
-                        scaleY = scaleToScreenY,
-                        out = observations
-                    )
-                } finally {
-                    iterator.delete()
-                }
-            }
-
-            api.clear()
+            val observations = runOcrPass(
+                api = api,
+                bitmap = targetBitmap,
+                offsetX = 0f,
+                offsetY = 0f,
+                scaleX = scaleToScreenX,
+                scaleY = scaleToScreenY
+            )
 
             OcrAdTextMatcher.evaluateObservations(
                 observations = observations,
                 screenWidth = screenWidth,
                 screenHeight = screenHeight,
-                isRealAdActivity = isRealAdActivity
+                isRealAdActivity = isRealAdActivity,
+                excludedRects = excludedRects
             )
         } catch (_: Throwable) {
             OcrAdScanResult(null, null, hasAdContext = isRealAdActivity)
@@ -204,9 +244,131 @@ class TesseractOcrEngine(
         }
     }
 
+    /**
+     * Dual corner OCR pass on cropped top-left and top-right regions (`22% x 15%`)
+     * to detect small `X`, `>>`, `Skip`, or `التخطي` buttons missed on full-screen downscales.
+     */
+    suspend fun recognizeCornerControls(
+        softwareScreenshot: Bitmap,
+        screenWidth: Int,
+        screenHeight: Int,
+        excludedRects: List<BoundsRect> = emptyList()
+    ): OcrAdScanResult = tessMutex.withLock {
+        if (softwareScreenshot.isRecycled || softwareScreenshot.width <= 0 || softwareScreenshot.height <= 0) {
+            return@withLock OcrAdScanResult(null, null, hasAdContext = false)
+        }
+
+        val ready = ensureInitializedLocked()
+        if (!ready) {
+            return@withLock OcrAdScanResult(null, null, hasAdContext = false)
+        }
+
+        val api = tessApi ?: return@withLock OcrAdScanResult(null, null, hasAdContext = false)
+
+        val bmpW = softwareScreenshot.width
+        val bmpH = softwareScreenshot.height
+        val cropW = (bmpW * OpenCvAdIconDetector.CORNER_WIDTH_RATIO).toInt().coerceIn(32, bmpW)
+        val cropH = (bmpH * OpenCvAdIconDetector.CORNER_HEIGHT_RATIO).toInt().coerceIn(32, bmpH)
+        val bmpToScreenX = screenWidth.toFloat() / bmpW.toFloat()
+        val bmpToScreenY = screenHeight.toFloat() / bmpH.toFloat()
+
+        val corners = listOf(
+            0 to 0,
+            (bmpW - cropW).coerceAtLeast(0) to 0
+        )
+
+        for ((cropX, cropY) in corners) {
+            var cropped: Bitmap? = null
+            var upscaled: Bitmap? = null
+            try {
+                cropped = Bitmap.createBitmap(softwareScreenshot, cropX, cropY, cropW, cropH)
+                val factor = if (cropW < 360) 2f else 1f
+                val ocrBitmap = if (factor > 1f) {
+                    Bitmap.createScaledBitmap(
+                        cropped,
+                        (cropW * factor).toInt(),
+                        (cropH * factor).toInt(),
+                        true
+                    ).also { upscaled = it }
+                } else {
+                    cropped
+                }
+
+                val observations = runOcrPass(
+                    api = api,
+                    bitmap = ocrBitmap,
+                    offsetX = cropX * bmpToScreenX,
+                    offsetY = cropY * bmpToScreenY,
+                    scaleX = bmpToScreenX / factor,
+                    scaleY = bmpToScreenY / factor
+                )
+
+                val result = OcrAdTextMatcher.evaluateCornerObservations(
+                    observations = observations,
+                    screenWidth = screenWidth,
+                    screenHeight = screenHeight,
+                    excludedRects = excludedRects
+                )
+                if (result.actionTargetBounds != null) {
+                    return@withLock result
+                }
+            } catch (_: Throwable) {
+                // Continue to remaining corner
+            } finally {
+                upscaled?.recycle()
+                cropped?.recycle()
+            }
+        }
+
+        return@withLock OcrAdScanResult(null, null, hasAdContext = false)
+    }
+
+    private fun runOcrPass(
+        api: TessBaseAPI,
+        bitmap: Bitmap,
+        offsetX: Float,
+        offsetY: Float,
+        scaleX: Float,
+        scaleY: Float
+    ): List<OcrObservation> {
+        api.setImage(bitmap)
+        api.getUTF8Text()
+
+        val observations = mutableListOf<OcrObservation>()
+        val iterator = api.resultIterator
+        if (iterator != null) {
+            try {
+                collectLevelObservations(
+                    iterator = iterator,
+                    level = TessBaseAPI.PageIteratorLevel.RIL_TEXTLINE,
+                    offsetX = offsetX,
+                    offsetY = offsetY,
+                    scaleX = scaleX,
+                    scaleY = scaleY,
+                    out = observations
+                )
+                collectLevelObservations(
+                    iterator = iterator,
+                    level = TessBaseAPI.PageIteratorLevel.RIL_WORD,
+                    offsetX = offsetX,
+                    offsetY = offsetY,
+                    scaleX = scaleX,
+                    scaleY = scaleY,
+                    out = observations
+                )
+            } finally {
+                iterator.delete()
+            }
+        }
+        api.clear()
+        return observations
+    }
+
     private fun collectLevelObservations(
         iterator: com.googlecode.tesseract.android.ResultIterator,
         level: Int,
+        offsetX: Float,
+        offsetY: Float,
         scaleX: Float,
         scaleY: Float,
         out: MutableList<OcrObservation>
@@ -219,10 +381,10 @@ class TesseractOcrEngine(
             val conf = iterator.confidence(level)
             if (!text.isNullOrBlank() && rect != null) {
                 val mapped = BoundsRect(
-                    left = (rect.left * scaleX).toInt(),
-                    top = (rect.top * scaleY).toInt(),
-                    right = (rect.right * scaleX).toInt(),
-                    bottom = (rect.bottom * scaleY).toInt()
+                    left = (offsetX + rect.left * scaleX).toInt(),
+                    top = (offsetY + rect.top * scaleY).toInt(),
+                    right = (offsetX + rect.right * scaleX).toInt(),
+                    bottom = (offsetY + rect.bottom * scaleY).toInt()
                 )
                 out.add(OcrObservation(text = text, bounds = mapped, confidence = conf))
             }

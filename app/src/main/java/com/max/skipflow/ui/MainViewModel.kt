@@ -2,7 +2,10 @@ package com.max.skipflow.ui
 
 import android.app.Application
 import android.content.Context
+import android.content.Intent
 import android.media.AudioManager
+import android.net.Uri
+import android.provider.Settings
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
@@ -34,6 +37,7 @@ data class MainUiState(
     val stats: DailyStats = DailyStats(),
     val disabledPackages: Set<String> = emptySet(),
     val healthStatus: HealthStatus = HealthStatus(),
+    val canDrawOverlays: Boolean = false,
     val isServiceConnected: Boolean = false,
     val isCallInProgress: Boolean = false,
     val installedApps: List<InstalledAppInfo> = emptyList(),
@@ -72,6 +76,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val audioManager = application.getSystemService(Context.AUDIO_SERVICE) as AudioManager
 
     private val _healthStatus = MutableStateFlow(healthCheckManager.checkHealth())
+    private val _canDrawOverlays = MutableStateFlow(Settings.canDrawOverlays(application))
     private val _isCallInProgress = MutableStateFlow(false)
     private val _installedApps = MutableStateFlow<List<InstalledAppInfo>>(emptyList())
     private val _isLoadingApps = MutableStateFlow(true)
@@ -89,11 +94,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     private val systemStatusState = combine(
         _healthStatus,
+        _canDrawOverlays,
         SkipFlowAccessibilityService.isServiceConnected,
         _isCallInProgress,
         otaUpdater.state
-    ) { health, connected, inCall, ota ->
-        SystemStatusSlice(health, connected, inCall, ota)
+    ) { health, overlayAllowed, connected, inCall, ota ->
+        SystemStatusSlice(health, overlayAllowed, connected, inCall, ota)
     }
 
     val uiState: StateFlow<MainUiState> = combine(
@@ -108,6 +114,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             stats = stats,
             disabledPackages = disabledPkgs,
             healthStatus = sysSlice.health,
+            canDrawOverlays = sysSlice.canDrawOverlays,
             isServiceConnected = sysSlice.connected,
             isCallInProgress = sysSlice.inCall,
             installedApps = appsSlice.apps,
@@ -130,6 +137,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun refreshSystemState() {
         repository.refreshDateRolloverIfNeeded()
         _healthStatus.value = healthCheckManager.checkHealth()
+        _canDrawOverlays.value = Settings.canDrawOverlays(getApplication())
         _isCallInProgress.value = CallStateMonitor.isCallActive(audioManager)
     }
 
@@ -167,6 +175,23 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun setBounceBackFromPlayStore(enabled: Boolean) {
         repository.setBounceBackFromPlayStore(enabled)
+    }
+
+    fun setLiveDebugOverlayEnabled(context: Context, enabled: Boolean) {
+        repository.setLiveDebugOverlayEnabled(enabled)
+        if (enabled && !Settings.canDrawOverlays(context)) {
+            openOverlayPermissionSettings(context)
+        }
+    }
+
+    fun openOverlayPermissionSettings(context: Context) {
+        val intent = Intent(
+            Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+            Uri.parse("package:${context.packageName}")
+        ).apply {
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        runCatching { context.startActivity(intent) }
     }
 
     fun setPackageEnabled(packageName: String, enabled: Boolean) {
@@ -218,6 +243,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     private data class SystemStatusSlice(
         val health: HealthStatus,
+        val canDrawOverlays: Boolean,
         val connected: Boolean,
         val inCall: Boolean,
         val ota: OtaUpdateState

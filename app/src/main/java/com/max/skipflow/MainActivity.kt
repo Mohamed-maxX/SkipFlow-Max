@@ -165,6 +165,10 @@ private fun SkipFlowAppShell(viewModel: MainViewModel) {
                     onToastChanged = viewModel::setToastOnSkip,
                     onPauseDuringCallsChanged = viewModel::setPauseDuringCalls,
                     onBounceBackFromPlayStoreChanged = viewModel::setBounceBackFromPlayStore,
+                    onLiveDebugOverlayChanged = { enabled ->
+                        viewModel.setLiveDebugOverlayEnabled(context, enabled)
+                    },
+                    onRequestOverlayPermission = { viewModel.openOverlayPermissionSettings(context) },
                     onCheckForUpdates = viewModel::checkForUpdates,
                     onDownloadUpdate = viewModel::downloadUpdate,
                     onInstallApk = { file -> viewModel.installDownloadedApk(context, file) },

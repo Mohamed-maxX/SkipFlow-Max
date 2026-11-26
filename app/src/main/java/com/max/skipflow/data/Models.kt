@@ -6,7 +6,8 @@ data class SkipFlowSettings(
     val vibrateOnSkip: Boolean = true,
     val toastOnSkip: Boolean = true,
     val pauseDuringCalls: Boolean = true,
-    val bounceBackFromPlayStore: Boolean = true
+    val bounceBackFromPlayStore: Boolean = true,
+    val liveDebugOverlayEnabled: Boolean = true
 )
 
 data class DailyStats(

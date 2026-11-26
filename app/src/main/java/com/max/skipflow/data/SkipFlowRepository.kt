@@ -89,7 +89,8 @@ class SkipFlowRepository(
             vibrateOnSkip = storage.getBoolean(KEY_VIBRATE_ON_SKIP, true),
             toastOnSkip = storage.getBoolean(KEY_TOAST_ON_SKIP, true),
             pauseDuringCalls = storage.getBoolean(KEY_PAUSE_DURING_CALLS, true),
-            bounceBackFromPlayStore = storage.getBoolean(KEY_BOUNCE_BACK_PLAY_STORE, true)
+            bounceBackFromPlayStore = storage.getBoolean(KEY_BOUNCE_BACK_PLAY_STORE, true),
+            liveDebugOverlayEnabled = storage.getBoolean(KEY_LIVE_DEBUG_OVERLAY, true)
         )
     }
 
@@ -162,6 +163,13 @@ class SkipFlowRepository(
         }
     }
 
+    fun setLiveDebugOverlayEnabled(enabled: Boolean) {
+        synchronized(lock) {
+            storage.putBoolean(KEY_LIVE_DEBUG_OVERLAY, enabled)
+            _settings.value = _settings.value.copy(liveDebugOverlayEnabled = enabled)
+        }
+    }
+
     fun setPackageEnabled(packageName: String, enabled: Boolean) {
         synchronized(lock) {
             val updated = _disabledPackages.value.toMutableSet()
@@ -224,6 +232,7 @@ class SkipFlowRepository(
         private const val KEY_TOAST_ON_SKIP = "toast_on_skip"
         private const val KEY_PAUSE_DURING_CALLS = "pause_during_calls"
         private const val KEY_BOUNCE_BACK_PLAY_STORE = "bounce_back_play_store"
+        private const val KEY_LIVE_DEBUG_OVERLAY = "live_debug_overlay_enabled"
         private const val KEY_BLACKLIST_INITIALIZED = "blacklist_mode_initialized"
         private const val KEY_DISABLED_PACKAGES = "disabled_packages"
         private const val KEY_STATS_DATE = "stats_date"
