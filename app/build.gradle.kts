@@ -46,6 +46,10 @@ android {
         buildConfig = true
     }
 
+    androidResources {
+        noCompress += "traineddata"
+    }
+
     packaging {
         resources {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"
@@ -66,6 +70,8 @@ dependencies {
     implementation(libs.androidx.material.icons.extended)
     implementation(libs.kotlinx.coroutines.android)
     implementation(libs.okhttp)
+    implementation(libs.opencv)
+    implementation(libs.tesseract4android)
 
     testImplementation(libs.junit)
     testImplementation(libs.kotlinx.coroutines.test)
