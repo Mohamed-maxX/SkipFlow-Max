@@ -2,6 +2,7 @@ package com.max.skipflow.vision
 
 import android.graphics.Bitmap
 import com.max.skipflow.engine.BoundsRect
+import com.max.skipflow.engine.DisplayGeometry
 import org.opencv.android.OpenCVLoader
 import org.opencv.android.Utils
 import org.opencv.core.Core
@@ -73,7 +74,7 @@ object OpenCvTemplateEvaluator {
 /**
  * Multi-scale OpenCV Template Matching (`TM_CCOEFF_NORMED`) detector using programmatically
  * generated white-on-dark/gray `X` and `>>` templates at scales 0.7x, 1.0x, and 1.3x
- * across the top-left (22% x 15%) and top-right (22% x 15%) screen corners.
+ * across dynamic top-left/top-right screen corners (Portrait: 22% x 16%, Landscape: 18% x 26%).
  */
 class OpenCvAdIconDetector {
 
@@ -114,21 +115,28 @@ class OpenCvAdIconDetector {
 
         val bmpW = softwareScreenshot.width
         val bmpH = softwareScreenshot.height
-        val scaleToBmpX = bmpW.toFloat() / screenWidth.toFloat()
-        val scaleToBmpY = bmpH.toFloat() / screenHeight.toFloat()
+        val (effectiveScreenW, effectiveScreenH) = DisplayGeometry.alignScreenToBitmap(
+            screenWidth = screenWidth,
+            screenHeight = screenHeight,
+            bitmapWidth = bmpW,
+            bitmapHeight = bmpH
+        )
+        val scaleToBmpX = bmpW.toFloat() / effectiveScreenW.toFloat()
+        val scaleToBmpY = bmpH.toFloat() / effectiveScreenH.toFloat()
 
-        val leftWidthRatio = if (preferTopLeftCorner) TOP_LEFT_PRIORITY_WIDTH_RATIO else CORNER_WIDTH_RATIO
-        val topLeftCropW = (bmpW * leftWidthRatio).toInt().coerceAtLeast(48)
-        val topRightCropW = (bmpW * CORNER_WIDTH_RATIO).toInt().coerceAtLeast(48)
-        val cropH = (bmpH * CORNER_HEIGHT_RATIO).toInt().coerceAtLeast(48)
-        val baseSizePx = (BASE_TEMPLATE_DP * density * scaleToBmpX).coerceIn(24f, topLeftCropW * 0.75f)
+        // Crop ratios adapt dynamically to orientation directly from the captured bitmap dimensions:
+        // Portrait: top 16% height x first/last 22% width; Landscape: top 26% height x first/last 18% width.
+        val cornerRatios = DisplayGeometry.cornerRatiosFor(bmpW, bmpH)
+        val cropW = (bmpW * cornerRatios.widthRatio).toInt().coerceIn(48, bmpW)
+        val cropH = (bmpH * cornerRatios.heightRatio).toInt().coerceIn(48, bmpH)
+        val baseSizePx = (BASE_TEMPLATE_DP * density * scaleToBmpX).coerceIn(24f, minOf(cropW, cropH) * 0.75f)
 
         val fullMat = Mat()
         return try {
             Utils.bitmapToMat(softwareScreenshot, fullMat)
 
-            val topLeftCrop = CvRect(0, 0, topLeftCropW.coerceAtMost(bmpW), cropH.coerceAtMost(bmpH))
-            val topRightX = (bmpW - topRightCropW).coerceAtLeast(0)
+            val topLeftCrop = CvRect(0, 0, cropW.coerceAtMost(bmpW), cropH.coerceAtMost(bmpH))
+            val topRightX = (bmpW - cropW).coerceAtLeast(0)
             val topRightCrop = CvRect(topRightX, 0, (bmpW - topRightX).coerceAtLeast(1), cropH.coerceAtMost(bmpH))
 
             val topLeftDetections = mutableListOf<VisualIconDetection>()
@@ -361,9 +369,10 @@ class OpenCvAdIconDetector {
     }
 
     companion object {
-        const val CORNER_WIDTH_RATIO = 0.22f
-        const val TOP_LEFT_PRIORITY_WIDTH_RATIO = 0.20f
-        const val CORNER_HEIGHT_RATIO = 0.15f
+        const val CORNER_WIDTH_RATIO = DisplayGeometry.PORTRAIT_CORNER_WIDTH_RATIO
+        const val CORNER_HEIGHT_RATIO = DisplayGeometry.PORTRAIT_CORNER_HEIGHT_RATIO
+        const val LANDSCAPE_CORNER_WIDTH_RATIO = DisplayGeometry.LANDSCAPE_CORNER_WIDTH_RATIO
+        const val LANDSCAPE_CORNER_HEIGHT_RATIO = DisplayGeometry.LANDSCAPE_CORNER_HEIGHT_RATIO
         private const val BASE_TEMPLATE_DP = 36f
     }
 }

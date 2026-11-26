@@ -4,6 +4,7 @@ import android.graphics.Bitmap
 import com.googlecode.tesseract.android.TessBaseAPI
 import com.max.skipflow.engine.AdDetectionRules
 import com.max.skipflow.engine.BoundsRect
+import com.max.skipflow.engine.DisplayGeometry
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 
@@ -176,7 +177,8 @@ object OcrAdTextMatcher {
     ): Boolean {
         if (bounds.isEmpty) return false
         if (bounds.width < 10 || bounds.height < 10) return false
-        if (bounds.width > screenWidth * 0.75f || bounds.height > screenHeight * 0.16f) return false
+        val maxHeightRatio = if (screenWidth > screenHeight) 0.28f else 0.18f
+        if (bounds.width > screenWidth * 0.75f || bounds.height > screenHeight * maxHeightRatio) return false
         return bounds.centerX in 2..(screenWidth - 2) && bounds.centerY in 2..(screenHeight - 2)
     }
 }
@@ -212,18 +214,28 @@ class TesseractOcrEngine(
         var scaledBitmap: Bitmap? = null
 
         return@withLock try {
-            val targetBitmap = if (softwareScreenshot.width > MAX_OCR_WIDTH) {
-                val ratio = MAX_OCR_WIDTH.toFloat() / softwareScreenshot.width.toFloat()
-                val targetH = (softwareScreenshot.height * ratio).toInt().coerceAtLeast(1)
-                Bitmap.createScaledBitmap(softwareScreenshot, MAX_OCR_WIDTH, targetH, true).also {
+            val bmpW = softwareScreenshot.width
+            val bmpH = softwareScreenshot.height
+            val (effectiveScreenW, effectiveScreenH) = DisplayGeometry.alignScreenToBitmap(
+                screenWidth = screenWidth,
+                screenHeight = screenHeight,
+                bitmapWidth = bmpW,
+                bitmapHeight = bmpH
+            )
+            val maxDim = maxOf(bmpW, bmpH)
+            val targetBitmap = if (maxDim > MAX_OCR_LONG_SIDE) {
+                val ratio = MAX_OCR_LONG_SIDE.toFloat() / maxDim.toFloat()
+                val targetW = (bmpW * ratio).toInt().coerceAtLeast(1)
+                val targetH = (bmpH * ratio).toInt().coerceAtLeast(1)
+                Bitmap.createScaledBitmap(softwareScreenshot, targetW, targetH, true).also {
                     scaledBitmap = it
                 }
             } else {
                 softwareScreenshot
             }
 
-            val scaleToScreenX = screenWidth.toFloat() / targetBitmap.width.toFloat()
-            val scaleToScreenY = screenHeight.toFloat() / targetBitmap.height.toFloat()
+            val scaleToScreenX = effectiveScreenW.toFloat() / targetBitmap.width.toFloat()
+            val scaleToScreenY = effectiveScreenH.toFloat() / targetBitmap.height.toFloat()
 
             val observations = runOcrPass(
                 api = api,
@@ -236,8 +248,8 @@ class TesseractOcrEngine(
 
             OcrAdTextMatcher.evaluateObservations(
                 observations = observations,
-                screenWidth = screenWidth,
-                screenHeight = screenHeight,
+                screenWidth = effectiveScreenW,
+                screenHeight = effectiveScreenH,
                 isRealAdActivity = isRealAdActivity,
                 excludedRects = excludedRects
             )
@@ -249,8 +261,8 @@ class TesseractOcrEngine(
     }
 
     /**
-     * Dual corner OCR pass on cropped top-left and top-right regions (`22% x 15%`)
-     * to detect small `X`, `>>`, `Skip`, or `التخطي` buttons missed on full-screen downscales.
+     * Dual corner OCR pass on orientation-aware top-left and top-right crops
+     * (Portrait: 22% x 16%, Landscape: 18% x 26%) to detect small `X`, `>>`, `Skip`, or `التخطي` buttons.
      */
     suspend fun recognizeCornerControls(
         softwareScreenshot: Bitmap,
@@ -271,10 +283,17 @@ class TesseractOcrEngine(
 
         val bmpW = softwareScreenshot.width
         val bmpH = softwareScreenshot.height
-        val cropW = (bmpW * OpenCvAdIconDetector.CORNER_WIDTH_RATIO).toInt().coerceIn(32, bmpW)
-        val cropH = (bmpH * OpenCvAdIconDetector.CORNER_HEIGHT_RATIO).toInt().coerceIn(32, bmpH)
-        val bmpToScreenX = screenWidth.toFloat() / bmpW.toFloat()
-        val bmpToScreenY = screenHeight.toFloat() / bmpH.toFloat()
+        val (effectiveScreenW, effectiveScreenH) = DisplayGeometry.alignScreenToBitmap(
+            screenWidth = screenWidth,
+            screenHeight = screenHeight,
+            bitmapWidth = bmpW,
+            bitmapHeight = bmpH
+        )
+        val ratios = DisplayGeometry.cornerRatiosFor(bmpW, bmpH)
+        val cropW = (bmpW * ratios.widthRatio).toInt().coerceIn(32, bmpW)
+        val cropH = (bmpH * ratios.heightRatio).toInt().coerceIn(32, bmpH)
+        val bmpToScreenX = effectiveScreenW.toFloat() / bmpW.toFloat()
+        val bmpToScreenY = effectiveScreenH.toFloat() / bmpH.toFloat()
 
         val corners = listOf(
             0 to 0,
@@ -286,7 +305,7 @@ class TesseractOcrEngine(
             var upscaled: Bitmap? = null
             try {
                 cropped = Bitmap.createBitmap(softwareScreenshot, cropX, cropY, cropW, cropH)
-                val factor = if (cropW < 360) 2f else 1f
+                val factor = if (cropW < 360 || cropH < 240) 2f else 1f
                 val ocrBitmap = if (factor > 1f) {
                     Bitmap.createScaledBitmap(
                         cropped,
@@ -309,8 +328,8 @@ class TesseractOcrEngine(
 
                 val result = OcrAdTextMatcher.evaluateCornerObservations(
                     observations = observations,
-                    screenWidth = screenWidth,
-                    screenHeight = screenHeight,
+                    screenWidth = effectiveScreenW,
+                    screenHeight = effectiveScreenH,
                     excludedRects = excludedRects
                 )
                 if (result.actionTargetBounds != null) {
@@ -425,7 +444,7 @@ class TesseractOcrEngine(
 
     companion object {
         private const val OCR_LANGUAGES = "ara+eng"
-        private const val MAX_OCR_WIDTH = 760
+        private const val MAX_OCR_LONG_SIDE = 1680
         private const val MAX_OCR_ITEMS = 120
     }
 }

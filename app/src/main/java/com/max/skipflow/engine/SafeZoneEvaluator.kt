@@ -1,12 +1,14 @@
 package com.max.skipflow.engine
 
 /**
- * Anti-Misclick Safe Zone validator.
- * - For YouTube Skip Ad buttons: allows anywhere safely visible on screen (including portrait lower-right third).
+ * Anti-Misclick Safe Zone validator with dynamic Portrait/Landscape orientation support:
+ * - For YouTube Skip Ad buttons: allows anywhere safely visible on screen in both Portrait and
+ *   Landscape (including bottom-right corner `"التخطي"` / `"Skip"`).
  * - For Game Ads:
  *   - Explicit "Continue to app" / "Close ad" labels allow safe clickable control sizes anywhere visible.
- *   - Smart Corner Detector (`GAME_AD_ICON`) checks 18dp..80dp controls in top 16% & left/right 22%.
- *   - Standard Game Ad Skip/Close checks corner regions & compact dimensions.
+ *   - Smart Corner Detector (`GAME_AD_ICON`) adapts dynamically:
+ *     - Portrait: top 16% height x first/last 22% width.
+ *     - Landscape: top 26% height x first/last 18% width (accounts for shorter height & notches).
  */
 object SafeZoneEvaluator {
 
@@ -27,35 +29,43 @@ object SafeZoneEvaluator {
         if (cx < EDGE_MARGIN_PX || cx > screenWidth - EDGE_MARGIN_PX) return false
         if (cy < EDGE_MARGIN_PX || cy > screenHeight - EDGE_MARGIN_PX) return false
 
+        val ratios = DisplayGeometry.cornerRatiosFor(screenWidth, screenHeight)
+        val isLandscape = ratios.isLandscape
+
         if (targetType == AdTargetType.YOUTUBE_SKIP_AD) {
-            return bounds.width <= screenWidth * 0.85f && bounds.height <= screenHeight * 0.25f
+            val maxHeightRatio = if (isLandscape) 0.40f else 0.25f
+            return bounds.width <= screenWidth * 0.85f && bounds.height <= screenHeight * maxHeightRatio
         }
 
         if (targetType == AdTargetType.GAME_AD_CONTINUE) {
-            return bounds.width <= screenWidth * 0.85f && bounds.height <= screenHeight * 0.18f
+            val maxHeightRatio = if (isLandscape) 0.28f else 0.18f
+            return bounds.width <= screenWidth * 0.85f && bounds.height <= screenHeight * maxHeightRatio
         }
 
         if (targetType == AdTargetType.YOUTUBE_POPUP_DISMISS) {
+            val maxHeightRatio = if (isLandscape) 0.28f else 0.16f
             return bounds.width <= screenWidth * 0.65f &&
-                bounds.height <= screenHeight * 0.16f &&
+                bounds.height <= screenHeight * maxHeightRatio &&
                 cy in (screenHeight * 0.25f)..(screenHeight * 0.96f)
         }
 
-        val maxAllowedWidth = screenWidth * 0.55f
-        val maxAllowedHeight = screenHeight * 0.18f
+        val maxAllowedWidth = screenWidth * (if (isLandscape) 0.45f else 0.55f)
+        val maxAllowedHeight = screenHeight * (if (isLandscape) 0.30f else 0.18f)
         if (bounds.width > maxAllowedWidth || bounds.height > maxAllowedHeight) return false
 
         val xRatio = cx / screenWidth.toFloat()
         val yRatio = cy / screenHeight.toFloat()
 
         if (targetType == AdTargetType.GAME_AD_ICON) {
-            val inTopBand = yRatio <= 0.16f
-            val inFarLeftOrRight = xRatio <= 0.22f || xRatio >= 0.78f
+            val inTopBand = yRatio <= ratios.heightRatio
+            val inFarLeftOrRight = xRatio <= ratios.widthRatio || xRatio >= (1f - ratios.widthRatio)
             return inTopBand && inFarLeftOrRight
         }
 
-        val inTopRight = xRatio >= 0.65f && yRatio <= 0.25f
-        val inTopLeft = xRatio <= 0.35f && yRatio <= 0.25f
+        val topCornerY = if (isLandscape) 0.28f else 0.25f
+        val sideCornerX = if (isLandscape) 0.24f else 0.35f
+        val inTopRight = xRatio >= (1f - sideCornerX) && yRatio <= topCornerY
+        val inTopLeft = xRatio <= sideCornerX && yRatio <= topCornerY
         val inBottomCorner = (xRatio >= 0.58f || xRatio <= 0.42f) && yRatio in 0.58f..0.94f
 
         return inTopRight || inTopLeft || inBottomCorner

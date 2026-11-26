@@ -6,9 +6,11 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.content.res.Configuration
 import android.graphics.Bitmap
 import android.graphics.Path
 import android.graphics.Rect
+import android.hardware.display.DisplayManager
 import android.media.AudioManager
 import android.os.Build
 import android.os.Handler
@@ -123,6 +125,11 @@ class SkipFlowAccessibilityService : AccessibilityService() {
     override fun onServiceConnected() {
         super.onServiceConnected()
         _isServiceConnected.value = true
+    }
+
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        visionGenerationId.incrementAndGet()
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
@@ -436,7 +443,7 @@ class SkipFlowAccessibilityService : AccessibilityService() {
     }
 
     private fun resolveActiveApplicationPackage(fallbackPackage: String? = null): String? {
-        val (screenW, screenH, _) = getScreenMetrics()
+        val (screenW, screenH, _) = getCurrentDisplayMetrics()
         val tempRect = Rect()
         val snapshots = mutableListOf<WindowSnapshot>()
 
@@ -515,7 +522,7 @@ class SkipFlowAccessibilityService : AccessibilityService() {
         var realAdActivityActive = isCurrentActivityRealAdScreen(monitoredPackage)
         val preferTopLeftCorner = realAdActivityActive &&
             AdDetectionRules.isTtRewardExpressActivity(currentActivityClassName)
-        val (screenW, screenH, _) = getScreenMetrics()
+        val (screenW, screenH, _) = getCurrentDisplayMetrics()
 
         try {
             for (root in candidateWindows) {
@@ -798,7 +805,7 @@ class SkipFlowAccessibilityService : AccessibilityService() {
     ) {
         if (!isStillValidForVisionTap(expectedPackage, scanGeneration)) return
 
-        val (screenW, screenH, density) = getScreenMetrics()
+        val (screenW, screenH, density) = getCurrentDisplayMetrics()
         val confirmedBeforeOcr = isRealAdActivity || hasExplicitAdTreeText
         var targetBounds: BoundsRect? = null
         var targetType: AdTargetType = AdTargetType.GAME_AD_ICON
@@ -1090,7 +1097,7 @@ class SkipFlowAccessibilityService : AccessibilityService() {
         isRealAdActivity: Boolean,
         preferTopLeftCorner: Boolean
     ): TreeScanResult {
-        val (screenW, screenH, density) = getScreenMetrics()
+        val (screenW, screenH, density) = getCurrentDisplayMetrics()
         val queue = ArrayDeque<Triple<AccessibilityNodeInfo, Int, Boolean>>()
         val rootClass = root.className?.toString()
         val rootIsWebView = rootClass?.contains("WebView", ignoreCase = true) == true
@@ -1293,7 +1300,8 @@ class SkipFlowAccessibilityService : AccessibilityService() {
 
     private fun isTopLeftPriorityRegion(bounds: BoundsRect, screenW: Int, screenH: Int): Boolean {
         if (screenW <= 0 || screenH <= 0) return false
-        return bounds.centerX <= screenW * 0.20f && bounds.centerY <= screenH * 0.15f
+        val ratios = DisplayGeometry.cornerRatiosFor(screenW, screenH)
+        return bounds.centerX <= screenW * ratios.widthRatio && bounds.centerY <= screenH * ratios.heightRatio
     }
 
     private fun isHigherPriorityMatch(
@@ -1372,9 +1380,10 @@ class SkipFlowAccessibilityService : AccessibilityService() {
                         parentRect.right,
                         parentRect.bottom
                     )
+                    val maxParentHeightRatio = if (screenW > screenH) 0.35f else 0.22f
                     if (!parentBounds.isEmpty &&
                         parentBounds.width <= screenW * 0.75f &&
-                        parentBounds.height <= screenH * 0.22f
+                        parentBounds.height <= screenH * maxParentHeightRatio
                     ) {
                         if (nextParent != null) safeRecycle(nextParent)
                         return parentBounds
@@ -1476,11 +1485,16 @@ class SkipFlowAccessibilityService : AccessibilityService() {
         stageNumber: Int,
         countAsNewAdSkip: Boolean
     ) {
-        val centerX = bounds.centerX.toFloat()
-        val centerY = bounds.centerY.toFloat()
+        val (currentW, currentH, _) = getCurrentDisplayMetrics()
+        val (tapX, tapY) = DisplayGeometry.clampTapPoint(
+            x = bounds.centerX.toFloat(),
+            y = bounds.centerY.toFloat(),
+            screenWidth = currentW,
+            screenHeight = currentH
+        )
 
         val path = Path().apply {
-            moveTo(centerX, centerY)
+            moveTo(tapX, tapY)
         }
         val gesture = GestureDescription.Builder()
             .addStroke(GestureDescription.StrokeDescription(path, 0L, 55L))
@@ -1595,18 +1609,65 @@ class SkipFlowAccessibilityService : AccessibilityService() {
         }
     }
 
-    private fun getScreenMetrics(): Triple<Int, Int, Float> {
-        val windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
-        val density = resources.displayMetrics.density.coerceAtLeast(1f)
-        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+    private fun findActiveApplicationWindowBounds(): BoundsRect? {
+        val tempRect = Rect()
+        var bestFocusedOrActive: BoundsRect? = null
+        runCatching {
+            for (window in windows) {
+                if (window.type != AccessibilityWindowInfo.TYPE_APPLICATION) continue
+                window.getBoundsInScreen(tempRect)
+                val rect = BoundsRect(tempRect.left, tempRect.top, tempRect.right, tempRect.bottom)
+                if (rect.isEmpty) continue
+                if (window.isActive || window.isFocused) {
+                    return rect
+                }
+                if (bestFocusedOrActive == null ||
+                    rect.width.toLong() * rect.height.toLong() >
+                    bestFocusedOrActive!!.width.toLong() * bestFocusedOrActive!!.height.toLong()
+                ) {
+                    bestFocusedOrActive = rect
+                }
+            }
+        }
+        return bestFocusedOrActive
+    }
+
+    /**
+     * Dynamically queries current display dimensions on every scan cycle without caching Portrait size.
+     */
+    private fun getCurrentDisplayMetrics(): Triple<Int, Int, Float> {
+        val displayManager = getSystemService(Context.DISPLAY_SERVICE) as? DisplayManager
+        val defaultDisplay = displayManager?.getDisplay(Display.DEFAULT_DISPLAY)
+        val metricsContext = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && defaultDisplay != null) {
+            runCatching { createDisplayContext(defaultDisplay) }.getOrDefault(this)
+        } else {
+            this
+        }
+
+        val windowManager = metricsContext.getSystemService(Context.WINDOW_SERVICE) as WindowManager
+        val density = metricsContext.resources.displayMetrics.density.coerceAtLeast(1f)
+
+        val (rawW, rawH) = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             val bounds = windowManager.currentWindowMetrics.bounds
-            Triple(bounds.width(), bounds.height(), density)
+            bounds.width() to bounds.height()
         } else {
             val metrics = DisplayMetrics()
             @Suppress("DEPRECATION")
             windowManager.defaultDisplay.getRealMetrics(metrics)
-            Triple(metrics.widthPixels, metrics.heightPixels, metrics.density.coerceAtLeast(1f))
+            metrics.widthPixels to metrics.heightPixels
         }
+
+        val configIsLandscape =
+            resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE ||
+                metricsContext.resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
+
+        val (resolvedW, resolvedH) = DisplayGeometry.resolveDynamicDimensions(
+            windowWidth = rawW,
+            windowHeight = rawH,
+            activeAppBounds = findActiveApplicationWindowBounds(),
+            configIsLandscape = configIsLandscape
+        )
+        return Triple(resolvedW, resolvedH, density)
     }
 
     private fun cancelPendingVolumeRestore() {

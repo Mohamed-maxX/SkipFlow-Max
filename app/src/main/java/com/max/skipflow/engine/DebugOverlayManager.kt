@@ -4,6 +4,7 @@ import android.content.Context
 import android.graphics.Color
 import android.graphics.PixelFormat
 import android.graphics.drawable.GradientDrawable
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.provider.Settings
@@ -86,16 +87,30 @@ class DebugOverlayManager(private val context: Context) {
     }
 
     private fun showOrUpdateOnMain(line: String) {
+        val density = context.resources.displayMetrics.density.coerceAtLeast(1f)
+        val (currentW, currentH) = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            val bounds = windowManager.currentWindowMetrics.bounds
+            bounds.width() to bounds.height()
+        } else {
+            context.resources.displayMetrics.widthPixels to context.resources.displayMetrics.heightPixels
+        }
+        val maxW = (currentW * 0.92f).toInt().coerceAtLeast(120)
+        val topOffsetY = ((if (currentW > currentH) 8f else 28f) * density).toInt()
+
         val existing = overlayView
         if (existing != null) {
+            existing.maxWidth = maxW
             existing.text = line
+            val lp = existing.layoutParams as? WindowManager.LayoutParams
+            if (lp != null && lp.y != topOffsetY) {
+                lp.y = topOffsetY
+                runCatching { windowManager.updateViewLayout(existing, lp) }
+            }
             return
         }
 
-        val density = context.resources.displayMetrics.density.coerceAtLeast(1f)
         val padH = (12f * density).toInt()
         val padV = (5f * density).toInt()
-        val maxW = (context.resources.displayMetrics.widthPixels * 0.92f).toInt()
 
         val pill = TextView(context).apply {
             text = line
@@ -124,7 +139,7 @@ class DebugOverlayManager(private val context: Context) {
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
-            y = (28f * density).toInt()
+            y = topOffsetY
         }
 
         runCatching {

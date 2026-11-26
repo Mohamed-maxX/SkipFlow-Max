@@ -158,4 +158,29 @@ class VisionEnginesTest {
         )
         assertEquals("TTRewardVideoActivity | إعلان: نعم | لقطة: OK | OCV CROSS_X (0.82)", line)
     }
+
+    @Test
+    fun `OcrAdTextMatcher accepts Landscape corner icons within 18pct x 26pct and maps full bounds`() {
+        val landW = 2400
+        val landH = 1080
+
+        val landscapeCornerSkip = OcrAdTextMatcher.evaluateCornerObservations(
+            observations = listOf(OcrObservation(">>", BoundsRect(120, 180, 220, 260), 86f)),
+            screenWidth = landW,
+            screenHeight = landH
+        )
+        assertEquals(BoundsRect(120, 180, 220, 260), landscapeCornerSkip.actionTargetBounds)
+
+        val landscapeFullAdClose = OcrAdTextMatcher.evaluateObservations(
+            observations = listOf(
+                OcrObservation("Sponsored", BoundsRect(80, 920, 280, 980), 90f),
+                OcrObservation("Close", BoundsRect(2200, 170, 2340, 260), 88f)
+            ),
+            screenWidth = landW,
+            screenHeight = landH,
+            isRealAdActivity = false
+        )
+        assertTrue(landscapeFullAdClose.hasAdContext)
+        assertEquals(BoundsRect(2200, 170, 2340, 260), landscapeFullAdClose.actionTargetBounds)
+    }
 }

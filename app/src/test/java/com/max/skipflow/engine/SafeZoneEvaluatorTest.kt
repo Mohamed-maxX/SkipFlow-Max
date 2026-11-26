@@ -56,4 +56,32 @@ class SafeZoneEvaluatorTest {
         val dismissBtn = BoundsRect(120, 1750, 480, 1870)
         assertTrue(SafeZoneEvaluator.isWithinSafeZone(dismissBtn, screenW, screenH, AdTargetType.YOUTUBE_POPUP_DISMISS))
     }
+
+    @Test
+    fun `supports Landscape corner regions 18pct x 26pct and YouTube bottom-right skip`() {
+        val landW = 2400
+        val landH = 1080
+
+        // Landscape corner button pushed slightly down (y = 220..260 -> ~22% of 1080, x <= 18%)
+        val landscapeTopLeftIcon = BoundsRect(40, 190, 148, 298) // center = (94, 244) -> x=3.9%, y=22.6% <= 26%
+        val landscapeTopRightIcon = BoundsRect(2220, 180, 2328, 288) // center = (2274, 234) -> x=94.75% >= 82%, y=21.7% <= 26%
+        val landscapeCenterTopInvalid = BoundsRect(1100, 180, 1208, 288) // x=48% not in 18% side band
+        val landscapeTooLowInvalid = BoundsRect(40, 320, 148, 428) // centerY = 374 = 34.6% > 26%
+
+        assertTrue(SafeZoneEvaluator.isCornerAdIconSize(landscapeTopLeftIcon, landW, landH, density))
+        assertTrue(SafeZoneEvaluator.isCornerAdIconSize(landscapeTopRightIcon, landW, landH, density))
+        assertFalse(SafeZoneEvaluator.isCornerAdIconSize(landscapeCenterTopInvalid, landW, landH, density))
+        assertFalse(SafeZoneEvaluator.isCornerAdIconSize(landscapeTooLowInvalid, landW, landH, density))
+
+        // YouTube landscape skip button ("التخطي" / "Skip") in bottom-right corner
+        val youtubeLandscapeSkip = BoundsRect(2020, 860, 2340, 960)
+        assertTrue(
+            SafeZoneEvaluator.isWithinSafeZone(
+                youtubeLandscapeSkip,
+                landW,
+                landH,
+                AdTargetType.YOUTUBE_SKIP_AD
+            )
+        )
+    }
 }
