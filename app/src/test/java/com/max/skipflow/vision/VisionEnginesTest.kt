@@ -11,39 +11,39 @@ import org.junit.Test
 class VisionEnginesTest {
 
     @Test
-    fun `OpenCvTemplateEvaluator enforces 0_65 threshold and skips audio icon rects`() {
+    fun `OpenCvTemplateEvaluator enforces 0_78 threshold and skips audio icon rects`() {
         val audioIconRect = BoundsRect(30, 80, 120, 170)
         val muteMatch = VisualIconDetection(
             boundsOnScreen = BoundsRect(35, 85, 115, 165),
             centerX = 75f,
             centerY = 125f,
             shape = DetectedIconShape.CROSS_X,
-            confidenceScore = 0.89
+            confidenceScore = 0.91
         )
         val closeChevronMatch = VisualIconDetection(
             boundsOnScreen = BoundsRect(930, 85, 1020, 175),
             centerX = 975f,
             centerY = 130f,
             shape = DetectedIconShape.DOUBLE_CHEVRON,
-            confidenceScore = 0.74
+            confidenceScore = 0.84
         )
-        val weakMatch = VisualIconDetection(
+        val belowThresholdGameButton = VisualIconDetection(
             boundsOnScreen = BoundsRect(930, 200, 1010, 280),
             centerX = 970f,
             centerY = 240f,
             shape = DetectedIconShape.CROSS_X,
-            confidenceScore = 0.58
+            confidenceScore = 0.74
         )
 
         val chosen = OpenCvTemplateEvaluator.selectBestMatch(
-            candidates = listOf(muteMatch, weakMatch, closeChevronMatch),
+            candidates = listOf(muteMatch, belowThresholdGameButton, closeChevronMatch),
             excludedRects = listOf(audioIconRect)
         )
         assertEquals(closeChevronMatch, chosen)
 
         assertNull(
             OpenCvTemplateEvaluator.selectBestMatch(
-                candidates = listOf(weakMatch),
+                candidates = listOf(belowThresholdGameButton),
                 excludedRects = emptyList()
             )
         )
@@ -85,20 +85,48 @@ class VisionEnginesTest {
     }
 
     @Test
-    fun `OcrAdTextMatcher matches full-screen Arabic and English skip buttons and gates Close on ad context`() {
+    fun `OcrAdTextMatcher matches full-screen Arabic and English skip buttons and gates all taps on ad context`() {
         val screenW = 1080
         val screenH = 2400
 
-        val closeWithoutAd = OcrAdTextMatcher.evaluateObservations(
+        // Even "Skip" in a normal game screen must NOT tap unless ad context is confirmed
+        val skipWithoutAd = OcrAdTextMatcher.evaluateObservations(
             observations = listOf(
+                OcrObservation("Skip", BoundsRect(900, 100, 1020, 180), 90f),
+                OcrObservation("Close", BoundsRect(40, 100, 140, 180), 90f)
+            ),
+            screenWidth = screenW,
+            screenHeight = screenH,
+            isRealAdActivity = false
+        )
+        assertNull(skipWithoutAd.actionTargetBounds)
+        assertFalse(skipWithoutAd.hasAdContext)
+
+        // Random broken word "AD" should not falsely verify gameplay
+        val strayAdWord = OcrAdTextMatcher.evaluateObservations(
+            observations = listOf(
+                OcrObservation("AD", BoundsRect(200, 300, 280, 350), 80f),
                 OcrObservation("Close", BoundsRect(900, 100, 1020, 180), 90f)
             ),
             screenWidth = screenW,
             screenHeight = screenH,
             isRealAdActivity = false
         )
-        assertNull(closeWithoutAd.actionTargetBounds)
-        assertFalse(closeWithoutAd.hasAdContext)
+        assertNull(strayAdWord.actionTargetBounds)
+        assertFalse(strayAdWord.hasAdContext)
+
+        // "Install" + "Close" confirms active ad context
+        val closeWithInstallContext = OcrAdTextMatcher.evaluateObservations(
+            observations = listOf(
+                OcrObservation("Install", BoundsRect(300, 2000, 780, 2120), 92f),
+                OcrObservation("Close", BoundsRect(920, 90, 1040, 170), 89f)
+            ),
+            screenWidth = screenW,
+            screenHeight = screenH,
+            isRealAdActivity = false
+        )
+        assertTrue(closeWithInstallContext.hasAdContext)
+        assertEquals(BoundsRect(920, 90, 1040, 170), closeWithInstallContext.actionTargetBounds)
 
         val closeWithAdContext = OcrAdTextMatcher.evaluateObservations(
             observations = listOf(

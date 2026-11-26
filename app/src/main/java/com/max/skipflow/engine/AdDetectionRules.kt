@@ -201,31 +201,41 @@ object AdDetectionRules {
         "why this ad"
     )
 
-    // Exact Ad SDK Activity identifiers (never matches generic UnityPlayerActivity, MainActivity, or LoadingActivity)
-    private val realAdActivityKeywords = listOf(
+    // Strict list of genuine ad network Activity identifiers (`unityplayer` is explicitly excluded).
+    val AD_ACTIVITY_KEYWORDS = listOf(
         "ttrewardexpressvideoactivity",
-        "ttrewardvideoactivity",
-        "expressvideo",
+        "ttfullscreenexpressvideoactivity",
+        "openadsdk",
         "adactivity",
-        "interstitial",
-        "reward",
-        "fullscreenad",
-        "pangle",
-        "ttreward",
-        "ttfullscreen",
-        "applovin",
-        "unityads",
-        "adunitactivity",
-        "vungle",
+        "applovinfullscreenactivity",
+        "maxfullscreen",
         "ironsource",
         "mbridge",
-        "mbreward",
-        "inmobi",
-        "chartboost",
-        "fyber",
-        "bigo",
-        "audiencenetworkactivity",
-        "openadsdk"
+        "vungle",
+        "interstitial",
+        "reward",
+        "audiencenetworkactivity"
+    )
+
+    // Explicit visible ad text labels confirming a screen is actively displaying an ad.
+    private val explicitAdContextKeywords = listOf(
+        "إعلان",
+        "اعلان",
+        "اعرف المزيد",
+        "تخطي الإعلان",
+        "تخطي الاعلان",
+        "تخطي الإعلانات",
+        "إغلاق الإعلان",
+        "اغلاق الاعلان",
+        "المتابعة إلى التطبيق",
+        "المتابعة الى التطبيق",
+        "sponsored",
+        "install",
+        "learn more",
+        "skip ad",
+        "skip ads",
+        "close ad",
+        "continue to app"
     )
 
     private val excludedCornerIconKeywords = listOf(
@@ -335,7 +345,33 @@ object AdDetectionRules {
     fun isRealAdActivity(className: CharSequence?): Boolean {
         if (className.isNullOrBlank()) return false
         val lower = className.toString().lowercase()
-        return realAdActivityKeywords.any { keyword -> lower.contains(keyword) }
+        if (lower.contains("unityplayer")) return false
+        return AD_ACTIVITY_KEYWORDS.any { keyword -> lower.contains(keyword) }
+    }
+
+    fun isExplicitAdSdkViewId(viewIdResourceName: String?): Boolean {
+        val idLower = viewIdResourceName?.trim()?.lowercase() ?: return false
+        if (gameAdSkipViewIdContains.any { idLower.contains(it) }) return true
+        if (gameAdCloseViewIdContains.any { idLower.contains(it) }) return true
+        val idSuffix = extractViewIdSuffix(viewIdResourceName) ?: return false
+        return (idSuffix.startsWith("al_") && (idSuffix.contains("close") || idSuffix.contains("skip"))) ||
+            (idSuffix.startsWith("unity") && (idSuffix.contains("close") || idSuffix.contains("skip"))) ||
+            (idSuffix.startsWith("tt_") && idSuffix.contains("close")) ||
+            (idSuffix.startsWith("mbridge_") && idSuffix.contains("close"))
+    }
+
+    fun hasExplicitAdContextText(
+        text: CharSequence?,
+        contentDescription: CharSequence?
+    ): Boolean {
+        val normText = normalizeText(text, maxLength = 64)
+        val normDesc = normalizeText(contentDescription, maxLength = 64)
+        return matchesExplicitAdContextText(normText) || matchesExplicitAdContextText(normDesc)
+    }
+
+    private fun matchesExplicitAdContextText(normalized: String?): Boolean {
+        if (normalized == null) return false
+        return explicitAdContextKeywords.any { keyword -> normalized.contains(keyword, ignoreCase = true) }
     }
 
     fun isTtRewardExpressActivity(className: CharSequence?): Boolean {

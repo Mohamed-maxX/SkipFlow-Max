@@ -61,12 +61,16 @@ object OcrAdTextMatcher {
         "اعلان",
         "اعرف المزيد",
         "sponsored",
+        "install",
         "learn more",
         "تخطي الإعلان",
-        "skip ad"
+        "تخطي الاعلان",
+        "skip ad",
+        "skip ads",
+        "close ad",
+        "إغلاق الإعلان",
+        "اغلاق الاعلان"
     )
-
-    private val adWordRegex = Regex("""(?i)\bad\b""")
 
     fun evaluateObservations(
         observations: List<OcrObservation>,
@@ -115,7 +119,9 @@ object OcrAdTextMatcher {
             }
         }
 
-        val winner = bestHighPriority ?: if (hasAdContext) bestContextual else null
+        // Strict verification: never trigger ANY OCR tap unless the screen is a confirmed AdActivity
+        // or actively displays explicit ad text.
+        val winner = if (hasAdContext) (bestHighPriority ?: bestContextual) else null
         return OcrAdScanResult(
             actionTargetBounds = winner?.first?.bounds,
             matchedKeyword = winner?.second,
@@ -160,10 +166,7 @@ object OcrAdTextMatcher {
     }
 
     private fun isAdContextText(normalized: String): Boolean {
-        if (adContextKeywords.any { normalized.contains(it, ignoreCase = true) }) {
-            return true
-        }
-        return adWordRegex.containsMatchIn(normalized)
+        return adContextKeywords.any { normalized.contains(it, ignoreCase = true) }
     }
 
     private fun isPlausibleButtonBox(

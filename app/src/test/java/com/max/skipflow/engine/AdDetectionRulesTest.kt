@@ -147,10 +147,10 @@ class AdDetectionRulesTest {
         val realAds = listOf(
             "com.google.android.gms.ads.AdActivity",
             "com.applovin.adview.AppLovinFullscreenActivity",
-            "com.unity3d.services.ads.adunit.AdUnitActivity",
-            "com.unity3d.ads.UnityAdsFullscreenActivity",
+            "com.applovin.mediation.MaxFullscreenAdActivity",
             "com.bytedance.sdk.openadsdk.activity.TTRewardVideoActivity",
             "com.bytedance.sdk.openadsdk.activity.TTRewardExpressVideoActivity",
+            "com.bytedance.sdk.openadsdk.activity.TTFullScreenExpressVideoActivity",
             "com.bytedance.sdk.openadsdk.activity.TTFullScreenVideoActivity",
             "com.mbridge.msdk.reward.player.MBRewardVideoActivity",
             "com.ironsource.sdk.controller.InterstitialActivity",
@@ -158,12 +158,12 @@ class AdDetectionRulesTest {
             "com.facebook.ads.AudienceNetworkActivity",
             "sg.bigo.ads.ad.interstitial.BigoInterstitialActivity",
             "com.inmobi.ads.rendering.InMobiAdActivity",
-            "com.chartboost.sdk.view.CBImpressionActivity",
             "com.fyber.inneractive.sdk.activities.InneractiveFullscreenAdActivity"
         )
         for (cls in realAds) {
             assertTrue("Expected real ad activity: $cls", AdDetectionRules.isRealAdActivity(cls))
         }
+        assertFalse(AdDetectionRules.AD_ACTIVITY_KEYWORDS.any { it.contains("unityplayer") })
         assertTrue(
             AdDetectionRules.isTtRewardExpressActivity(
                 "com.bytedance.sdk.openadsdk.activity.TTRewardExpressVideoActivity"
@@ -172,6 +172,7 @@ class AdDetectionRulesTest {
 
         val nonAds = listOf(
             "com.unity3d.player.UnityPlayerActivity",
+            "com.example.UnityPlayerGameActivity",
             "com.android.vending.AssetBrowserActivity",
             "com.example.LoadingActivity",
             "com.example.MainActivity"
@@ -179,6 +180,13 @@ class AdDetectionRulesTest {
         for (cls in nonAds) {
             assertFalse("Expected non-ad activity: $cls", AdDetectionRules.isRealAdActivity(cls))
         }
+
+        assertTrue(AdDetectionRules.hasExplicitAdContextText("Sponsored", null))
+        assertTrue(AdDetectionRules.hasExplicitAdContextText(null, "Learn More"))
+        assertTrue(AdDetectionRules.hasExplicitAdContextText("Install", null))
+        assertTrue(AdDetectionRules.hasExplicitAdContextText("اعرف المزيد", null))
+        assertTrue(AdDetectionRules.hasExplicitAdContextText("إعلان", null))
+        assertFalse(AdDetectionRules.hasExplicitAdContextText("Settings", "Pause Game"))
     }
 
     @Test

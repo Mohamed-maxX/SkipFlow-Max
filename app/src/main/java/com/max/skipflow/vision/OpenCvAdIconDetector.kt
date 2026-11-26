@@ -38,7 +38,7 @@ data class OpenCvCornerScanSummary(
  */
 object OpenCvTemplateEvaluator {
 
-    const val MATCH_THRESHOLD = 0.65
+    const val MATCH_THRESHOLD = 0.78
     val SCALES = floatArrayOf(0.7f, 1.0f, 1.3f)
 
     fun isInsideExcludedRect(
