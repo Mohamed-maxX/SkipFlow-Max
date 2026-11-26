@@ -1,7 +1,5 @@
 package com.max.skipflow.engine
 
-import kotlin.math.abs
-
 sealed interface StageDecision {
     data class ExecuteTap(
         val stageNumber: Int,
@@ -12,15 +10,14 @@ sealed interface StageDecision {
 }
 
 /**
- * Handles multi-stage game ads (e.g. initial close/skip >> or X followed by a second end-card X)
- * while enforcing an 1800ms cooldown to prevent repeated clicks and avoid double-counting stats.
+ * Handles multi-stage game ads (e.g. initial close/skip `>>` or `X` followed by a second end-card `X`)
+ * with a fast 1000ms cooldown and without freezing same-spot retries (`>>` -> `X` or missed taps).
  */
 class MultiStageAdStateMachine {
 
     private var activePackage: String? = null
     private var stageCount: Int = 0
     private var lastTapAtMs: Long = 0L
-    private var lastBounds: BoundsRect? = null
     private var lastPopupDismissAtMs: Long = 0L
 
     fun evaluateCandidate(
@@ -39,7 +36,7 @@ class MultiStageAdStateMachine {
 
         val elapsedSinceLastTap = nowMs - lastTapAtMs
         if (lastTapAtMs > 0L && elapsedSinceLastTap in 0 until TAP_COOLDOWN_MS) {
-            return StageDecision.Ignore("tap_cooldown_1800ms")
+            return StageDecision.Ignore("tap_cooldown_1000ms")
         }
 
         val isSameSession = activePackage == packageName &&
@@ -50,17 +47,7 @@ class MultiStageAdStateMachine {
             activePackage = packageName
             stageCount = 1
             lastTapAtMs = nowMs
-            lastBounds = bounds
             return StageDecision.ExecuteTap(stageNumber = 1, countAsNewAdSkip = true)
-        }
-
-        val prev = lastBounds
-        val sameSpot = prev != null &&
-            abs(prev.centerX - bounds.centerX) <= SAME_SPOT_TOLERANCE_PX &&
-            abs(prev.centerY - bounds.centerY) <= SAME_SPOT_TOLERANCE_PX
-
-        if (sameSpot && elapsedSinceLastTap < SAME_SPOT_SETTLE_MS) {
-            return StageDecision.Ignore("waiting_previous_button_dismiss")
         }
 
         if (stageCount >= MAX_STAGES_PER_AD) {
@@ -69,27 +56,29 @@ class MultiStageAdStateMachine {
 
         stageCount += 1
         lastTapAtMs = nowMs
-        lastBounds = bounds
         return StageDecision.ExecuteTap(
             stageNumber = stageCount,
             countAsNewAdSkip = false
         )
     }
 
+    fun remainingCooldownMs(nowMs: Long): Long {
+        if (lastTapAtMs <= 0L) return 0L
+        val elapsed = nowMs - lastTapAtMs
+        return if (elapsed in 0 until TAP_COOLDOWN_MS) TAP_COOLDOWN_MS - elapsed else 0L
+    }
+
     fun reset() {
         activePackage = null
         stageCount = 0
         lastTapAtMs = 0L
-        lastBounds = null
         lastPopupDismissAtMs = 0L
     }
 
     companion object {
-        const val TAP_COOLDOWN_MS = 1800L
-        const val SAME_SPOT_SETTLE_MS = 2000L
-        const val MULTI_STAGE_WINDOW_MS = 8500L
+        const val TAP_COOLDOWN_MS = 1000L
+        const val MULTI_STAGE_WINDOW_MS = 12_000L
         const val POPUP_COOLDOWN_MS = 2500L
-        const val SAME_SPOT_TOLERANCE_PX = 20
-        const val MAX_STAGES_PER_AD = 3
+        const val MAX_STAGES_PER_AD = 8
     }
 }

@@ -98,7 +98,8 @@ class OpenCvAdIconDetector {
         screenWidth: Int,
         screenHeight: Int,
         density: Float,
-        excludedRects: List<BoundsRect> = emptyList()
+        excludedRects: List<BoundsRect> = emptyList(),
+        preferTopLeftCorner: Boolean = false
     ): OpenCvCornerScanSummary {
         if (!ensureInitialized()) return OpenCvCornerScanSummary(null, 0.0)
         if (softwareScreenshot.isRecycled || softwareScreenshot.width <= 0 || softwareScreenshot.height <= 0) {
@@ -116,34 +117,41 @@ class OpenCvAdIconDetector {
         val scaleToBmpX = bmpW.toFloat() / screenWidth.toFloat()
         val scaleToBmpY = bmpH.toFloat() / screenHeight.toFloat()
 
-        val cropW = (bmpW * CORNER_WIDTH_RATIO).toInt().coerceAtLeast(48)
+        val leftWidthRatio = if (preferTopLeftCorner) TOP_LEFT_PRIORITY_WIDTH_RATIO else CORNER_WIDTH_RATIO
+        val topLeftCropW = (bmpW * leftWidthRatio).toInt().coerceAtLeast(48)
+        val topRightCropW = (bmpW * CORNER_WIDTH_RATIO).toInt().coerceAtLeast(48)
         val cropH = (bmpH * CORNER_HEIGHT_RATIO).toInt().coerceAtLeast(48)
-        val baseSizePx = (BASE_TEMPLATE_DP * density * scaleToBmpX).coerceIn(24f, cropW * 0.75f)
+        val baseSizePx = (BASE_TEMPLATE_DP * density * scaleToBmpX).coerceIn(24f, topLeftCropW * 0.75f)
 
         val fullMat = Mat()
         return try {
             Utils.bitmapToMat(softwareScreenshot, fullMat)
 
-            val topLeftCrop = CvRect(0, 0, cropW.coerceAtMost(bmpW), cropH.coerceAtMost(bmpH))
-            val topRightX = (bmpW - cropW).coerceAtLeast(0)
+            val topLeftCrop = CvRect(0, 0, topLeftCropW.coerceAtMost(bmpW), cropH.coerceAtMost(bmpH))
+            val topRightX = (bmpW - topRightCropW).coerceAtLeast(0)
             val topRightCrop = CvRect(topRightX, 0, (bmpW - topRightX).coerceAtLeast(1), cropH.coerceAtMost(bmpH))
 
-            val detections = mutableListOf<VisualIconDetection>()
-            var highestScore = 0.0
-
-            highestScore = maxOf(
-                highestScore,
-                matchTemplatesInCorner(
-                    fullMat = fullMat,
-                    cropRect = topLeftCrop,
-                    templates = templates,
-                    baseSizePx = baseSizePx,
-                    scaleToBmpX = scaleToBmpX,
-                    scaleToBmpY = scaleToBmpY,
-                    excludedRects = excludedRects,
-                    out = detections
-                )
+            val topLeftDetections = mutableListOf<VisualIconDetection>()
+            var highestScore = matchTemplatesInCorner(
+                fullMat = fullMat,
+                cropRect = topLeftCrop,
+                templates = templates,
+                baseSizePx = baseSizePx,
+                scaleToBmpX = scaleToBmpX,
+                scaleToBmpY = scaleToBmpY,
+                excludedRects = excludedRects,
+                out = topLeftDetections
             )
+
+            val topLeftWinner = OpenCvTemplateEvaluator.selectBestMatch(topLeftDetections, excludedRects)
+            if (preferTopLeftCorner && topLeftWinner != null) {
+                return OpenCvCornerScanSummary(
+                    detection = topLeftWinner,
+                    maxScore = highestScore
+                )
+            }
+
+            val topRightDetections = mutableListOf<VisualIconDetection>()
             highestScore = maxOf(
                 highestScore,
                 matchTemplatesInCorner(
@@ -154,11 +162,14 @@ class OpenCvAdIconDetector {
                     scaleToBmpX = scaleToBmpX,
                     scaleToBmpY = scaleToBmpY,
                     excludedRects = excludedRects,
-                    out = detections
+                    out = topRightDetections
                 )
             )
 
-            val winner = OpenCvTemplateEvaluator.selectBestMatch(detections, excludedRects)
+            val winner = OpenCvTemplateEvaluator.selectBestMatch(
+                candidates = topLeftDetections + topRightDetections,
+                excludedRects = excludedRects
+            )
             OpenCvCornerScanSummary(
                 detection = winner,
                 maxScore = highestScore
@@ -351,6 +362,7 @@ class OpenCvAdIconDetector {
 
     companion object {
         const val CORNER_WIDTH_RATIO = 0.22f
+        const val TOP_LEFT_PRIORITY_WIDTH_RATIO = 0.20f
         const val CORNER_HEIGHT_RATIO = 0.15f
         private const val BASE_TEMPLATE_DP = 36f
     }

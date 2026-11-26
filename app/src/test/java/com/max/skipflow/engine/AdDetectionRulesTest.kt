@@ -150,6 +150,7 @@ class AdDetectionRulesTest {
             "com.unity3d.services.ads.adunit.AdUnitActivity",
             "com.unity3d.ads.UnityAdsFullscreenActivity",
             "com.bytedance.sdk.openadsdk.activity.TTRewardVideoActivity",
+            "com.bytedance.sdk.openadsdk.activity.TTRewardExpressVideoActivity",
             "com.bytedance.sdk.openadsdk.activity.TTFullScreenVideoActivity",
             "com.mbridge.msdk.reward.player.MBRewardVideoActivity",
             "com.ironsource.sdk.controller.InterstitialActivity",
@@ -163,6 +164,11 @@ class AdDetectionRulesTest {
         for (cls in realAds) {
             assertTrue("Expected real ad activity: $cls", AdDetectionRules.isRealAdActivity(cls))
         }
+        assertTrue(
+            AdDetectionRules.isTtRewardExpressActivity(
+                "com.bytedance.sdk.openadsdk.activity.TTRewardExpressVideoActivity"
+            )
+        )
 
         val nonAds = listOf(
             "com.unity3d.player.UnityPlayerActivity",
@@ -221,5 +227,27 @@ class AdDetectionRulesTest {
                 isClickableOrHasClickableParent = true
             )
         )
+    }
+
+    @Test
+    fun `flags transient systemui, screenrecorder, keyboard, and SkipFlow overlay packages`() {
+        val transientPackages = listOf(
+            "com.android.systemui",
+            "com.miui.screenrecorder",
+            "com.oplus.screenrecorder",
+            "com.google.android.apps.recorder",
+            "com.samsung.android.honeyboard",
+            "com.google.android.inputmethod.latin",
+            "com.custom.keyboard.app",
+            "com.max.skipflow"
+        )
+        for (pkg in transientPackages) {
+            assertTrue(
+                "$pkg should be flagged as transient overlay/system package",
+                AdDetectionRules.isTransientOverlayPackage(pkg)
+            )
+        }
+        assertFalse(AdDetectionRules.isTransientOverlayPackage("com.game.play"))
+        assertFalse(AdDetectionRules.isTransientOverlayPackage(AdDetectionRules.YOUTUBE_PACKAGE))
     }
 }

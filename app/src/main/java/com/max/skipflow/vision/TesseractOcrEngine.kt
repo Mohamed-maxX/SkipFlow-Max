@@ -50,6 +50,7 @@ object OcrAdTextMatcher {
         "skip",
         "close",
         ">>",
+        "> >",
         "×",
         "✕",
         "✖"

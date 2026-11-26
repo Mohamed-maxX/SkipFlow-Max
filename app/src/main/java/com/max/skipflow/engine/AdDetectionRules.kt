@@ -74,8 +74,10 @@ object AdDetectionRules {
 
     private val gameAdSkipViewIdContains = listOf(
         "tt_top_skip",
+        "tt_reward_skip",
+        "tt_full_skip",
+        "tt_express_skip",
         "tt_video_ad_close",
-        "tt_reward_full_count_down",
         "skip_ad_button",
         "skip_button",
         "btn_skip",
@@ -162,6 +164,7 @@ object AdDetectionRules {
         "close",
         "dismiss",
         ">>",
+        "> >",
         "×",
         "✕",
         "✖"
@@ -181,7 +184,7 @@ object AdDetectionRules {
     )
 
     private val countdownRegex = Regex(
-        pattern = """(?i).*(\b(in|after|خلال|بعد)\s*\d+|\d+\s*(s|sec|secs|ث|ثانية|ثوان|ثواني)\b|^\d+$).*"""
+        pattern = """(?i).*(\b(in|after|خلال|بعد)\s*\d+|\d+\s*(s|sec|secs|ث|ثانية|ثوان|ثواني)\b|\b\d{1,2}:\d{2}\b|^\d+$).*"""
     )
 
     private val youtubeAdTextMarkers = listOf(
@@ -200,6 +203,9 @@ object AdDetectionRules {
 
     // Exact Ad SDK Activity identifiers (never matches generic UnityPlayerActivity, MainActivity, or LoadingActivity)
     private val realAdActivityKeywords = listOf(
+        "ttrewardexpressvideoactivity",
+        "ttrewardvideoactivity",
+        "expressvideo",
         "adactivity",
         "interstitial",
         "reward",
@@ -274,15 +280,17 @@ object AdDetectionRules {
         "تخطي",
         "إغلاق",
         ">>",
+        "> >",
         "×",
         "✕",
         "✖"
     )
 
     fun isStrictlyExcludedPackage(packageName: String): Boolean {
-        if (packageName in strictExcludedPackages) return true
         val lower = packageName.lowercase()
+        if (lower in strictExcludedPackages) return true
         if (isLauncherPackage(lower)) return true
+        if (lower.contains("screenrecorder")) return true
         return lower.startsWith("com.android.internal") ||
             lower.startsWith("com.android.providers.") ||
             lower.startsWith("com.android.camera") ||
@@ -301,13 +309,39 @@ object AdDetectionRules {
     fun isSystemPackage(packageName: String): Boolean = isStrictlyExcludedPackage(packageName)
 
     fun isInputMethodPackage(packageName: String): Boolean {
-        return packageName in imePackages || packageName.contains("inputmethod") || packageName.contains("keyboard")
+        val lower = packageName.lowercase()
+        return lower in imePackages || lower.contains("inputmethod") || lower.contains("keyboard")
+    }
+
+    /**
+     * Packages belonging to system overlays, screen recorders, keyboards, or SkipFlow Max itself
+     * whose TYPE_WINDOW_STATE_CHANGED events must never overwrite the foreground Activity/Package.
+     */
+    fun isTransientOverlayPackage(
+        packageName: String?,
+        selfPackage: String = SELF_PACKAGE
+    ): Boolean {
+        if (packageName.isNullOrBlank()) return false
+        val lower = packageName.trim().lowercase()
+        if (lower == "com.android.systemui") return true
+        if (lower == selfPackage.lowercase()) return true
+        if (lower in imePackages) return true
+        return lower.contains("screenrecorder") ||
+            lower.contains("recorder") ||
+            lower.contains("keyboard") ||
+            lower.contains("inputmethod")
     }
 
     fun isRealAdActivity(className: CharSequence?): Boolean {
         if (className.isNullOrBlank()) return false
         val lower = className.toString().lowercase()
         return realAdActivityKeywords.any { keyword -> lower.contains(keyword) }
+    }
+
+    fun isTtRewardExpressActivity(className: CharSequence?): Boolean {
+        if (className.isNullOrBlank()) return false
+        val lower = className.toString().lowercase()
+        return lower.contains("ttrewardexpress") || lower.contains("ttreward")
     }
 
     fun extractViewIdSuffix(viewIdResourceName: String?): String? {
