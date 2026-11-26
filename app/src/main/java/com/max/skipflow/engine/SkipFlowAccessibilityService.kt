@@ -30,7 +30,9 @@ import android.widget.Toast
 import androidx.annotation.RequiresApi
 import com.max.skipflow.SkipFlowApplication
 import com.max.skipflow.data.SkipFlowRepository
+import com.max.skipflow.vision.DetectedIconShape
 import com.max.skipflow.vision.OpenCvAdIconDetector
+import com.max.skipflow.vision.OpenCvTemplateEvaluator
 import com.max.skipflow.vision.TesseractOcrEngine
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -148,30 +150,45 @@ class SkipFlowAccessibilityService : AccessibilityService() {
         val isWindowChange = event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED
         val isTransientOverlay = AdDetectionRules.isTransientOverlayPackage(eventPkg, packageName)
 
+        // Anti-Redirect Bounce-Back: return user once if an ad click or auto-redirect
+        // opens Play Store (`com.android.vending`) or Android's app chooser / store picker
+        // (`android` / `ResolverActivity` / `ChooserActivity` / `"متجر Play"` / `"GetApps"` / `"حدد متجر تطبيقات"`).
+        if (!isTransientOverlay) {
+            val isChooserOrWindow = isWindowChange ||
+                AdDetectionRules.isAppChooserPackageOrActivity(eventPkg, event.className)
+            if (isChooserOrWindow) {
+                val chooserDialogDetected = hasStorePickerContent(event, eventPkg)
+                if (playStoreRedirectGuard.shouldBounceBack(
+                        enteredPackage = eventPkg,
+                        bounceBackEnabled = currentSettings.bounceBackFromPlayStore,
+                        nowMs = nowElapsed,
+                        enteredClassName = event.className,
+                        hasStoreChooserContent = chooserDialogDetected
+                    )
+                ) {
+                    stopCountdownPolling()
+                    activeMonitoredPackage = null
+                    _currentActivePackage.value = null
+                    performGlobalAction(GLOBAL_ACTION_BACK)
+                    emitStatusUpdate(
+                        pkg = eventPkg,
+                        isAdScreen = false,
+                        screenshotStatus = "-",
+                        detail = if (eventPkg == AdDetectionRules.PLAY_STORE_PACKAGE) {
+                            "رجوع تلقائي من المتجر"
+                        } else {
+                            "إغلاق نافذة اختيار المتجر"
+                        }
+                    )
+                    return
+                }
+            }
+        }
+
         // Never overwrite currentActivityPackage / currentActivityClassName from transient overlays
         // (`com.android.systemui`, screen recorders, keyboards, or SkipFlow Max's overlay).
         if (isWindowChange && !isTransientOverlay) {
             updateCurrentActivityTracking(eventPkg, event.className)
-
-            // Anti-Redirect Bounce-Back: return user once if an ad click redirected straight to Play Store
-            if (playStoreRedirectGuard.shouldBounceBack(
-                    enteredPackage = eventPkg,
-                    bounceBackEnabled = currentSettings.bounceBackFromPlayStore,
-                    nowMs = nowElapsed
-                )
-            ) {
-                stopCountdownPolling()
-                activeMonitoredPackage = null
-                _currentActivePackage.value = null
-                performGlobalAction(GLOBAL_ACTION_BACK)
-                emitStatusUpdate(
-                    pkg = eventPkg,
-                    isAdScreen = false,
-                    screenshotStatus = "-",
-                    detail = "رجوع تلقائي من المتجر"
-                )
-                return
-            }
 
             if (AdDetectionRules.isLauncherPackage(eventPkg)) {
                 playStoreRedirectGuard.clearOnLauncherOrUserExit()
@@ -591,6 +608,9 @@ class SkipFlowAccessibilityService : AccessibilityService() {
             val confirmedAdByTreeOrActivity = realAdActivityActive || hasExplicitAdTreeText
             isAdScreenActive = confirmedAdByTreeOrActivity ||
                 (monitoredPackage == AdDetectionRules.YOUTUBE_PACKAGE && hasYouTubeAd)
+            if (confirmedAdByTreeOrActivity) {
+                playStoreRedirectGuard.markActiveAdContext(monitoredPackage, nowElapsed)
+            }
 
             val explicitWinner = bestCandidate
             if (explicitWinner != null) {
@@ -813,18 +833,48 @@ class SkipFlowAccessibilityService : AccessibilityService() {
         var detectedAsAd = confirmedBeforeOcr
         var ocvMaxScore = 0.0
 
-        // 1. Strict Gate: ONLY run OpenCV (`>= 0.78`) & Corner OCR upfront when screen is
-        //    either a confirmed AdActivity OR actively displaying explicit ad text in Accessibility tree.
+        var effectiveExcludedRects = excludedRects
+
+        // 1. Strict Gate: ONLY run OpenCV & Corner OCR upfront when screen is
+        //    either a confirmed AdActivity (`>= 0.68`) OR actively displaying explicit ad text (`>= 0.78`).
         if (confirmedBeforeOcr) {
-            val ocvSummary = openCvAdIconDetector.detectCornerCloseIcon(
+            var ocvSummary = openCvAdIconDetector.detectCornerCloseIcon(
                 softwareScreenshot = softwareBitmap,
                 screenWidth = screenW,
                 screenHeight = screenH,
                 density = density,
-                excludedRects = excludedRects,
-                preferTopLeftCorner = preferTopLeftCorner
+                excludedRects = effectiveExcludedRects,
+                isConfirmedAdActivity = isRealAdActivity
             )
             ocvMaxScore = ocvSummary.maxScore
+
+            // If OpenCV spotted a `>>` chevron, verify via Corner OCR that it isn't part of a
+            // pure-canvas/WebView "Google Play >>" / "Install >>" store redirect pill.
+            var precomputedCornerOcr: com.max.skipflow.vision.OcrAdScanResult? = null
+            if (ocvSummary.detection?.shape == DetectedIconShape.DOUBLE_CHEVRON) {
+                val cornerOcr = tesseractOcrEngine.recognizeCornerControls(
+                    softwareScreenshot = softwareBitmap,
+                    screenWidth = screenW,
+                    screenHeight = screenH,
+                    excludedRects = effectiveExcludedRects
+                )
+                precomputedCornerOcr = cornerOcr
+                if (cornerOcr.storeExclusionRects.isNotEmpty()) {
+                    effectiveExcludedRects = effectiveExcludedRects + cornerOcr.storeExclusionRects
+                    val hit = ocvSummary.detection
+                    if (hit != null && OpenCvTemplateEvaluator.isInsideExcludedRect(hit.centerX, hit.centerY, effectiveExcludedRects)) {
+                        ocvSummary = openCvAdIconDetector.detectCornerCloseIcon(
+                            softwareScreenshot = softwareBitmap,
+                            screenWidth = screenW,
+                            screenHeight = screenH,
+                            density = density,
+                            excludedRects = effectiveExcludedRects,
+                            isConfirmedAdActivity = isRealAdActivity
+                        )
+                    }
+                }
+            }
+
             if (ocvSummary.detection != null) {
                 targetBounds = ocvSummary.detection.boundsOnScreen
                 targetType = AdTargetType.GAME_AD_ICON
@@ -837,12 +887,15 @@ class SkipFlowAccessibilityService : AccessibilityService() {
             }
 
             if (targetBounds == null) {
-                val cornerOcr = tesseractOcrEngine.recognizeCornerControls(
+                val cornerOcr = precomputedCornerOcr ?: tesseractOcrEngine.recognizeCornerControls(
                     softwareScreenshot = softwareBitmap,
                     screenWidth = screenW,
                     screenHeight = screenH,
-                    excludedRects = excludedRects
+                    excludedRects = effectiveExcludedRects
                 )
+                if (cornerOcr.storeExclusionRects.isNotEmpty()) {
+                    effectiveExcludedRects = effectiveExcludedRects + cornerOcr.storeExclusionRects
+                }
                 if (cornerOcr.actionTargetBounds != null) {
                     targetBounds = cornerOcr.actionTargetBounds
                     targetType = AdTargetType.GAME_AD_SKIP
@@ -860,10 +913,12 @@ class SkipFlowAccessibilityService : AccessibilityService() {
                 screenWidth = screenW,
                 screenHeight = screenH,
                 isRealAdActivity = confirmedBeforeOcr,
-                excludedRects = excludedRects
+                excludedRects = effectiveExcludedRects
             )
+            val combinedExcludedRects = effectiveExcludedRects + ocrResult.storeExclusionRects
             if (ocrResult.hasAdContext) {
                 detectedAsAd = true
+                playStoreRedirectGuard.markActiveAdContext(expectedPackage, SystemClock.elapsedRealtime())
             }
 
             if (ocrResult.hasAdContext && ocrResult.actionTargetBounds != null) {
@@ -877,8 +932,8 @@ class SkipFlowAccessibilityService : AccessibilityService() {
                     screenWidth = screenW,
                     screenHeight = screenH,
                     density = density,
-                    excludedRects = excludedRects,
-                    preferTopLeftCorner = preferTopLeftCorner
+                    excludedRects = combinedExcludedRects,
+                    isConfirmedAdActivity = false
                 )
                 ocvMaxScore = maxOf(ocvMaxScore, ocvSummary.maxScore)
                 if (ocvSummary.detection != null) {
@@ -895,7 +950,7 @@ class SkipFlowAccessibilityService : AccessibilityService() {
                         softwareScreenshot = softwareBitmap,
                         screenWidth = screenW,
                         screenHeight = screenH,
-                        excludedRects = excludedRects
+                        excludedRects = combinedExcludedRects
                     )
                     if (cornerOcr.actionTargetBounds != null) {
                         targetBounds = cornerOcr.actionTargetBounds
@@ -1156,6 +1211,23 @@ class SkipFlowAccessibilityService : AccessibilityService() {
                         }
                     }
 
+                    // Exclude any "Google Play >>" / "Play Store" / "GetApps" / "Install" / "تثبيت" pill bounds
+                    // so neither OpenCV nor OCR can tap a store-redirect chevron nearby.
+                    if (!isYouTube && AdDetectionRules.hasStoreRedirectKeyword(viewId, text, desc)) {
+                        node.getBoundsInScreen(tempRect)
+                        val storeRect = BoundsRect(tempRect.left, tempRect.top, tempRect.right, tempRect.bottom)
+                        if (!storeRect.isEmpty && storeRect.height <= screenH * 0.22f) {
+                            excludedRects.add(
+                                BoundsRect(
+                                    left = storeRect.left - 180,
+                                    top = storeRect.top - 16,
+                                    right = storeRect.right + 180,
+                                    bottom = storeRect.bottom + 16
+                                )
+                            )
+                        }
+                    }
+
                     val clickableSelfOrParent = node.isClickable || isAncestorClickable(node)
                     val explicitTarget = AdDetectionRules.matchCandidate(
                         packageName = monitoredPackage,
@@ -1167,8 +1239,9 @@ class SkipFlowAccessibilityService : AccessibilityService() {
                     )
 
                     if (explicitTarget != null) {
+                        val hasStorePillHierarchy = !isYouTube && hasStoreRedirectInHierarchy(node)
                         val isCountdownContainer = hasCountdownDescendant(node)
-                        if (!isCountdownContainer) {
+                        if (!hasStorePillHierarchy && !isCountdownContainer) {
                             val targetBounds = resolveEffectiveBounds(node, screenW, screenH, tempRect)
                             if (SafeZoneEvaluator.isWithinSafeZone(targetBounds, screenW, screenH, explicitTarget)) {
                                 val nextMatch = CandidateMatch(
@@ -1197,8 +1270,9 @@ class SkipFlowAccessibilityService : AccessibilityService() {
                             isAdActivityContext = true
                         )
                         if (contextualTarget != null) {
+                            val hasStorePillHierarchy = hasStoreRedirectInHierarchy(node)
                             val isCountdownContainer = hasCountdownDescendant(node)
-                            if (!isCountdownContainer) {
+                            if (!hasStorePillHierarchy && !isCountdownContainer) {
                                 val targetBounds = resolveEffectiveBounds(node, screenW, screenH, tempRect)
                                 if (SafeZoneEvaluator.isWithinSafeZone(targetBounds, screenW, screenH, contextualTarget)) {
                                     val nextMatch = CandidateMatch(
@@ -1224,6 +1298,7 @@ class SkipFlowAccessibilityService : AccessibilityService() {
                             val iconBounds = BoundsRect(tempRect.left, tempRect.top, tempRect.right, tempRect.bottom)
                             if (SafeZoneEvaluator.isCornerAdIconSize(iconBounds, screenW, screenH, density) &&
                                 !AdDetectionRules.isExcludedCornerIcon(viewId, text, desc) &&
+                                !hasStoreRedirectInHierarchy(node) &&
                                 !hasCountdownDescendant(node)
                             ) {
                                 cornerIconCandidates.add(
@@ -1333,6 +1408,109 @@ class SkipFlowAccessibilityService : AccessibilityService() {
             cls.endsWith(".view") ||
             cls.contains("button") ||
             (isWebViewNode && !cls.contains("webview"))
+    }
+
+    /**
+     * Checks node, immediate children, immediate parent, and parent siblings for store keywords
+     * ("Google Play", "Play Store", "GetApps", "Install", "تثبيت") so store redirect pills
+     * such as "Google Play >>" are never tapped as skip buttons.
+     */
+    private fun hasStoreRedirectInHierarchy(node: AccessibilityNodeInfo): Boolean {
+        if (AdDetectionRules.hasStoreRedirectKeyword(node.viewIdResourceName, node.text, node.contentDescription)) {
+            return true
+        }
+
+        val childCount = node.childCount.coerceAtMost(6)
+        for (i in 0 until childCount) {
+            val child = node.getChild(i) ?: continue
+            try {
+                if (AdDetectionRules.hasStoreRedirectKeyword(child.viewIdResourceName, child.text, child.contentDescription)) {
+                    return true
+                }
+            } finally {
+                safeRecycle(child)
+            }
+        }
+
+        val parent = node.parent ?: return false
+        try {
+            if (AdDetectionRules.hasStoreRedirectKeyword(parent.viewIdResourceName, parent.text, parent.contentDescription)) {
+                return true
+            }
+            val siblingCount = parent.childCount.coerceAtMost(8)
+            for (i in 0 until siblingCount) {
+                val sibling = parent.getChild(i) ?: continue
+                try {
+                    if (AdDetectionRules.hasStoreRedirectKeyword(sibling.viewIdResourceName, sibling.text, sibling.contentDescription)) {
+                        return true
+                    }
+                } finally {
+                    safeRecycle(sibling)
+                }
+            }
+        } finally {
+            safeRecycle(parent)
+        }
+        return false
+    }
+
+    private fun hasStorePickerContent(event: AccessibilityEvent, eventPkg: String): Boolean {
+        val eventCombinedText = event.text.joinToString(" ") { it?.toString().orEmpty() }
+        if (AdDetectionRules.hasStorePickerDialogText(eventCombinedText, event.contentDescription)) {
+            return true
+        }
+        val clsLower = event.className?.toString()?.lowercase().orEmpty()
+        val looksLikeDialogOrSheet = clsLower.contains("dialog") ||
+            clsLower.contains("sheet") ||
+            clsLower.contains("chooser") ||
+            clsLower.contains("resolver")
+        if (!looksLikeDialogOrSheet && !AdDetectionRules.isAppChooserPackageOrActivity(eventPkg, event.className)) {
+            return false
+        }
+
+        val root = runCatching { rootInActiveWindow }.getOrNull() ?: return false
+        val queue = ArrayDeque<AccessibilityNodeInfo>()
+        queue.add(root)
+        var visited = 0
+        var hasChooserHeader = false
+        var hasPlayLabel = false
+        var hasGetAppsLabel = false
+
+        try {
+            while (queue.isNotEmpty() && visited < 40) {
+                val current = queue.removeFirst()
+                visited++
+                try {
+                    val t = current.text?.toString()?.lowercase().orEmpty()
+                    val d = current.contentDescription?.toString()?.lowercase().orEmpty()
+                    val joined = "$t $d"
+                    if (joined.contains("حدد متجر تطبيقات")) {
+                        hasChooserHeader = true
+                        break
+                    }
+                    if (joined.contains("متجر play") || joined.contains("google play")) {
+                        hasPlayLabel = true
+                    }
+                    if (joined.contains("getapps")) {
+                        hasGetAppsLabel = true
+                    }
+                    val count = current.childCount.coerceAtMost(10)
+                    for (i in 0 until count) {
+                        val c = current.getChild(i) ?: continue
+                        queue.add(c)
+                    }
+                } finally {
+                    if (current !== root) safeRecycle(current)
+                }
+            }
+        } finally {
+            while (queue.isNotEmpty()) {
+                val rem = queue.removeFirst()
+                if (rem !== root) safeRecycle(rem)
+            }
+            safeRecycle(root)
+        }
+        return hasChooserHeader || (hasPlayLabel && hasGetAppsLabel)
     }
 
     private fun hasCountdownDescendant(node: AccessibilityNodeInfo): Boolean {
@@ -1719,9 +1897,9 @@ class SkipFlowAccessibilityService : AccessibilityService() {
         private const val MAX_SCAN_DEPTH = 40
         private const val CONTENT_SCAN_THROTTLE_MS = 180L
         private const val WINDOW_STATE_SCAN_GAP_MS = 50L
-        private const val COUNTDOWN_POLLING_INTERVAL_MS = 600L
-        private const val POLLING_MIN_SCAN_GAP_MS = 450L
-        private const val VISION_FALLBACK_COOLDOWN_MS = 900L
+        private const val COUNTDOWN_POLLING_INTERVAL_MS = 400L
+        private const val POLLING_MIN_SCAN_GAP_MS = 380L
+        private const val VISION_FALLBACK_COOLDOWN_MS = 800L
         private const val UNCONFIRMED_OCR_COOLDOWN_MS = 1_800L
         private const val SPARSE_TREE_NODE_THRESHOLD = 25
         private const val TOAST_COOLDOWN_MS = 2_400L

@@ -165,6 +165,7 @@ object AdDetectionRules {
         "dismiss",
         ">>",
         "> >",
+        ">",
         "×",
         "✕",
         "✖"
@@ -279,6 +280,32 @@ object AdDetectionRules {
         "إبلاغ",
         "بلاغ",
         "خيارات الإعلان"
+    )
+
+    // Store redirect CTA phrases (e.g., "Google Play >>", "GetApps", "Install", "تثبيت")
+    // that must NEVER be clicked as ad skip buttons.
+    private val storeRedirectKeywords = listOf(
+        "google play",
+        "play store",
+        "getapps",
+        "get apps",
+        "install",
+        "تثبيت",
+        "متجر play",
+        "متجر بلاي"
+    )
+
+    // Android / OEM app chooser & store picker identifiers for Anti-Redirect Bounce-Back.
+    private val appChooserKeywords = listOf(
+        "resolveractivity",
+        "chooseractivity",
+        "intentresolver"
+    )
+
+    private val storePickerDialogKeywords = listOf(
+        "حدد متجر تطبيقات",
+        "متجر play",
+        "getapps"
     )
 
     private val positiveCornerIconKeywords = listOf(
@@ -502,6 +529,11 @@ object AdDetectionRules {
             return null
         }
 
+        // Never treat store redirect pills (e.g. "Google Play >>", "GetApps", "Install", "تثبيت") as skip/close controls
+        if (hasStoreRedirectKeyword(idLower, normText, normDesc)) {
+            return null
+        }
+
         // 1. Explicit Ad SDK View IDs always match
         if (idLower != null) {
             if (gameAdSkipViewIdContains.any { idLower.contains(it) }) {
@@ -561,12 +593,60 @@ object AdDetectionRules {
         return combined.isNotEmpty() && excludedCornerIconKeywords.any { combined.contains(it) }
     }
 
+    fun hasStoreRedirectKeyword(
+        viewIdResourceName: String?,
+        text: CharSequence?,
+        contentDescription: CharSequence?
+    ): Boolean {
+        val normText = text?.toString()?.lowercase()
+        val normDesc = contentDescription?.toString()?.lowercase()
+        val normId = viewIdResourceName?.lowercase()
+        return listOfNotNull(normText, normDesc, normId).any { value ->
+            storeRedirectKeywords.any { kw -> value.contains(kw) }
+        }
+    }
+
+    fun isChevronOrSkipText(text: CharSequence?, contentDescription: CharSequence?): Boolean {
+        val combined = listOfNotNull(
+            normalizeText(text, maxLength = 32),
+            normalizeText(contentDescription, maxLength = 32)
+        ).joinToString(" ")
+        if (combined.isEmpty()) return false
+        return combined.contains(">") ||
+            combined.contains("skip") ||
+            combined.contains("تخطي")
+    }
+
+    fun isAppChooserPackageOrActivity(
+        packageName: String?,
+        className: CharSequence?
+    ): Boolean {
+        val pkgLower = packageName?.trim()?.lowercase().orEmpty()
+        if (pkgLower == "android" || pkgLower == "com.android.intentresolver") {
+            return true
+        }
+        if (appChooserKeywords.any { pkgLower.contains(it) }) return true
+        val clsLower = className?.toString()?.trim()?.lowercase().orEmpty()
+        return appChooserKeywords.any { clsLower.contains(it) }
+    }
+
+    fun hasStorePickerDialogText(text: CharSequence?, contentDescription: CharSequence?): Boolean {
+        val combined = listOfNotNull(
+            text?.toString()?.lowercase(),
+            contentDescription?.toString()?.lowercase()
+        ).joinToString(" ")
+        if (combined.isEmpty()) return false
+        return storePickerDialogKeywords.any { combined.contains(it) }
+    }
+
     fun isExcludedCornerIcon(
         viewIdResourceName: String?,
         text: CharSequence?,
         contentDescription: CharSequence?
     ): Boolean {
-        if (hasExcludedCornerKeyword(viewIdResourceName, text, contentDescription)) {
+        if (hasExcludedCornerKeyword(viewIdResourceName, text, contentDescription) ||
+            hasStoreRedirectKeyword(viewIdResourceName, text, contentDescription)
+        ) {
             return true
         }
 

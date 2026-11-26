@@ -27,24 +27,37 @@ class VisionEnginesTest {
             shape = DetectedIconShape.DOUBLE_CHEVRON,
             confidenceScore = 0.84
         )
-        val belowThresholdGameButton = VisualIconDetection(
+        val belowThresholdStrict = VisualIconDetection(
             boundsOnScreen = BoundsRect(930, 200, 1010, 280),
             centerX = 970f,
             centerY = 240f,
             shape = DetectedIconShape.CROSS_X,
-            confidenceScore = 0.74
+            confidenceScore = 0.72
         )
 
         val chosen = OpenCvTemplateEvaluator.selectBestMatch(
-            candidates = listOf(muteMatch, belowThresholdGameButton, closeChevronMatch),
-            excludedRects = listOf(audioIconRect)
+            candidates = listOf(muteMatch, belowThresholdStrict, closeChevronMatch),
+            excludedRects = listOf(audioIconRect),
+            threshold = OpenCvTemplateEvaluator.MATCH_THRESHOLD
         )
         assertEquals(closeChevronMatch, chosen)
 
+        // Rejected at 0.78 strict threshold
         assertNull(
             OpenCvTemplateEvaluator.selectBestMatch(
-                candidates = listOf(belowThresholdGameButton),
-                excludedRects = emptyList()
+                candidates = listOf(belowThresholdStrict),
+                excludedRects = emptyList(),
+                threshold = OpenCvTemplateEvaluator.thresholdForContext(isConfirmedAdActivity = false)
+            )
+        )
+
+        // Accepted at 0.68 threshold ONLY inside confirmed Ad Activities
+        assertEquals(
+            belowThresholdStrict,
+            OpenCvTemplateEvaluator.selectBestMatch(
+                candidates = listOf(belowThresholdStrict),
+                excludedRects = emptyList(),
+                threshold = OpenCvTemplateEvaluator.thresholdForContext(isConfirmedAdActivity = true)
             )
         )
     }
@@ -182,5 +195,31 @@ class VisionEnginesTest {
         )
         assertTrue(landscapeFullAdClose.hasAdContext)
         assertEquals(BoundsRect(2200, 170, 2340, 260), landscapeFullAdClose.actionTargetBounds)
+    }
+
+    @Test
+    fun `OcrAdTextMatcher rejects Google Play chevron pills and exports store exclusion rects`() {
+        val screenW = 1080
+        val screenH = 2400
+
+        // Single observation "Google Play >>" must never tap
+        val googlePlayPill = OcrAdTextMatcher.evaluateCornerObservations(
+            observations = listOf(OcrObservation("Google Play >>", BoundsRect(700, 90, 1040, 160), 90f)),
+            screenWidth = screenW,
+            screenHeight = screenH
+        )
+        assertNull(googlePlayPill.actionTargetBounds)
+        assertTrue(googlePlayPill.storeExclusionRects.isNotEmpty())
+
+        // Split words "Google Play" + nearby ">>" in same pill must ignore ">>"
+        val splitPillResult = OcrAdTextMatcher.evaluateCornerObservations(
+            observations = listOf(
+                OcrObservation("Google Play", BoundsRect(700, 95, 920, 155), 90f),
+                OcrObservation(">>", BoundsRect(940, 95, 1030, 155), 88f)
+            ),
+            screenWidth = screenW,
+            screenHeight = screenH
+        )
+        assertNull(splitPillResult.actionTargetBounds)
     }
 }

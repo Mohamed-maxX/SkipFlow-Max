@@ -258,4 +258,42 @@ class AdDetectionRulesTest {
         assertFalse(AdDetectionRules.isTransientOverlayPackage("com.game.play"))
         assertFalse(AdDetectionRules.isTransientOverlayPackage(AdDetectionRules.YOUTUBE_PACKAGE))
     }
+
+    @Test
+    fun `never matches Google Play or store redirect pills even with double chevron`() {
+        val storePills = listOf(
+            "Google Play >>",
+            "Play Store >>",
+            "GetApps >",
+            "Install >>",
+            "تثبيت >>"
+        )
+        for (pillText in storePills) {
+            assertNull(
+                "Must ignore store redirect pill: $pillText",
+                AdDetectionRules.matchCandidate(
+                    packageName = "com.game.play",
+                    viewIdResourceName = null,
+                    text = pillText,
+                    contentDescription = null,
+                    isClickableOrHasClickableParent = true,
+                    isAdActivityContext = true
+                )
+            )
+            assertTrue(AdDetectionRules.hasStoreRedirectKeyword(null, pillText, null))
+        }
+
+        // Plain ">>" without store text still matches inside real ad activity
+        assertEquals(
+            AdTargetType.GAME_AD_CLOSE,
+            AdDetectionRules.matchCandidate(
+                packageName = "com.game.play",
+                viewIdResourceName = null,
+                text = ">>",
+                contentDescription = null,
+                isClickableOrHasClickableParent = true,
+                isAdActivityContext = true
+            )
+        )
+    }
 }

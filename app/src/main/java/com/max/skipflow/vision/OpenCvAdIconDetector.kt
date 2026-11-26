@@ -40,7 +40,12 @@ data class OpenCvCornerScanSummary(
 object OpenCvTemplateEvaluator {
 
     const val MATCH_THRESHOLD = 0.78
+    const val CONFIRMED_AD_MATCH_THRESHOLD = 0.68
     val SCALES = floatArrayOf(0.7f, 1.0f, 1.3f)
+
+    fun thresholdForContext(isConfirmedAdActivity: Boolean): Double {
+        return if (isConfirmedAdActivity) CONFIRMED_AD_MATCH_THRESHOLD else MATCH_THRESHOLD
+    }
 
     fun isInsideExcludedRect(
         centerX: Float,
@@ -62,10 +67,11 @@ object OpenCvTemplateEvaluator {
 
     fun selectBestMatch(
         candidates: List<VisualIconDetection>,
-        excludedRects: List<BoundsRect>
+        excludedRects: List<BoundsRect>,
+        threshold: Double = MATCH_THRESHOLD
     ): VisualIconDetection? {
         return candidates
-            .filter { it.confidenceScore >= MATCH_THRESHOLD }
+            .filter { it.confidenceScore >= threshold }
             .filterNot { isInsideExcludedRect(it.centerX, it.centerY, excludedRects) }
             .maxByOrNull { it.confidenceScore }
     }
@@ -100,7 +106,7 @@ class OpenCvAdIconDetector {
         screenHeight: Int,
         density: Float,
         excludedRects: List<BoundsRect> = emptyList(),
-        preferTopLeftCorner: Boolean = false
+        isConfirmedAdActivity: Boolean = false
     ): OpenCvCornerScanSummary {
         if (!ensureInitialized()) return OpenCvCornerScanSummary(null, 0.0)
         if (softwareScreenshot.isRecycled || softwareScreenshot.width <= 0 || softwareScreenshot.height <= 0) {
@@ -113,6 +119,7 @@ class OpenCvAdIconDetector {
         val templates = getOrCreateTemplates()
         if (templates.isEmpty()) return OpenCvCornerScanSummary(null, 0.0)
 
+        val threshold = OpenCvTemplateEvaluator.thresholdForContext(isConfirmedAdActivity)
         val bmpW = softwareScreenshot.width
         val bmpH = softwareScreenshot.height
         val (effectiveScreenW, effectiveScreenH) = DisplayGeometry.alignScreenToBitmap(
@@ -139,7 +146,8 @@ class OpenCvAdIconDetector {
             val topRightX = (bmpW - cropW).coerceAtLeast(0)
             val topRightCrop = CvRect(topRightX, 0, (bmpW - topRightX).coerceAtLeast(1), cropH.coerceAtMost(bmpH))
 
-            val topLeftDetections = mutableListOf<VisualIconDetection>()
+            // Always scan BOTH top-left and top-right corners so top-right `>>` / `X` icons are detected immediately
+            val detections = mutableListOf<VisualIconDetection>()
             var highestScore = matchTemplatesInCorner(
                 fullMat = fullMat,
                 cropRect = topLeftCrop,
@@ -147,19 +155,11 @@ class OpenCvAdIconDetector {
                 baseSizePx = baseSizePx,
                 scaleToBmpX = scaleToBmpX,
                 scaleToBmpY = scaleToBmpY,
+                threshold = threshold,
                 excludedRects = excludedRects,
-                out = topLeftDetections
+                out = detections
             )
 
-            val topLeftWinner = OpenCvTemplateEvaluator.selectBestMatch(topLeftDetections, excludedRects)
-            if (preferTopLeftCorner && topLeftWinner != null) {
-                return OpenCvCornerScanSummary(
-                    detection = topLeftWinner,
-                    maxScore = highestScore
-                )
-            }
-
-            val topRightDetections = mutableListOf<VisualIconDetection>()
             highestScore = maxOf(
                 highestScore,
                 matchTemplatesInCorner(
@@ -169,14 +169,16 @@ class OpenCvAdIconDetector {
                     baseSizePx = baseSizePx,
                     scaleToBmpX = scaleToBmpX,
                     scaleToBmpY = scaleToBmpY,
+                    threshold = threshold,
                     excludedRects = excludedRects,
-                    out = topRightDetections
+                    out = detections
                 )
             )
 
             val winner = OpenCvTemplateEvaluator.selectBestMatch(
-                candidates = topLeftDetections + topRightDetections,
-                excludedRects = excludedRects
+                candidates = detections,
+                excludedRects = excludedRects,
+                threshold = threshold
             )
             OpenCvCornerScanSummary(
                 detection = winner,
@@ -196,6 +198,7 @@ class OpenCvAdIconDetector {
         baseSizePx: Float,
         scaleToBmpX: Float,
         scaleToBmpY: Float,
+        threshold: Double,
         excludedRects: List<BoundsRect>,
         out: MutableList<VisualIconDetection>
     ): Double {
@@ -233,7 +236,7 @@ class OpenCvAdIconDetector {
                         Imgproc.matchTemplate(cropGray, scaledTemplate, resultNormal, Imgproc.TM_CCOEFF_NORMED)
                         val mmrNormal = Core.minMaxLoc(resultNormal)
                         bestCornerScore = maxOf(bestCornerScore, mmrNormal.maxVal)
-                        if (mmrNormal.maxVal >= OpenCvTemplateEvaluator.MATCH_THRESHOLD) {
+                        if (mmrNormal.maxVal >= threshold) {
                             addDetectionIfNotExcluded(
                                 loc = mmrNormal.maxLoc,
                                 score = mmrNormal.maxVal,
@@ -252,7 +255,7 @@ class OpenCvAdIconDetector {
                         Imgproc.matchTemplate(cropInv, scaledTemplate, resultInv, Imgproc.TM_CCOEFF_NORMED)
                         val mmrInv = Core.minMaxLoc(resultInv)
                         bestCornerScore = maxOf(bestCornerScore, mmrInv.maxVal)
-                        if (mmrInv.maxVal >= OpenCvTemplateEvaluator.MATCH_THRESHOLD) {
+                        if (mmrInv.maxVal >= threshold) {
                             addDetectionIfNotExcluded(
                                 loc = mmrInv.maxLoc,
                                 score = mmrInv.maxVal,
@@ -319,12 +322,25 @@ class OpenCvAdIconDetector {
         cachedTemplates?.let { return it }
         val built = listOf(
             TemplateSpec(DetectedIconShape.CROSS_X, createCircleXTemplate()),
+            TemplateSpec(DetectedIconShape.CROSS_X, createRoundedRectXTemplate()),
             TemplateSpec(DetectedIconShape.CROSS_X, createPlainXTemplate()),
+            TemplateSpec(DetectedIconShape.CROSS_X, createThinPlainXTemplate()),
             TemplateSpec(DetectedIconShape.DOUBLE_CHEVRON, createCircleDoubleChevronTemplate()),
-            TemplateSpec(DetectedIconShape.DOUBLE_CHEVRON, createPlainDoubleChevronTemplate())
+            TemplateSpec(DetectedIconShape.DOUBLE_CHEVRON, createRoundedRectDoubleChevronTemplate()),
+            TemplateSpec(DetectedIconShape.DOUBLE_CHEVRON, createPlainDoubleChevronTemplate()),
+            TemplateSpec(DetectedIconShape.DOUBLE_CHEVRON, createThinPlainDoubleChevronTemplate())
         )
         cachedTemplates = built
         return built
+    }
+
+    private fun fillRoundedRect(mat: Mat, left: Int, top: Int, right: Int, bottom: Int, radius: Int, color: Scalar) {
+        Imgproc.rectangle(mat, Point((left + radius).toDouble(), top.toDouble()), Point((right - radius).toDouble(), bottom.toDouble()), color, -1)
+        Imgproc.rectangle(mat, Point(left.toDouble(), (top + radius).toDouble()), Point(right.toDouble(), (bottom - radius).toDouble()), color, -1)
+        Imgproc.circle(mat, Point((left + radius).toDouble(), (top + radius).toDouble()), radius, color, -1, Imgproc.LINE_AA, 0)
+        Imgproc.circle(mat, Point((right - radius).toDouble(), (top + radius).toDouble()), radius, color, -1, Imgproc.LINE_AA, 0)
+        Imgproc.circle(mat, Point((left + radius).toDouble(), (bottom - radius).toDouble()), radius, color, -1, Imgproc.LINE_AA, 0)
+        Imgproc.circle(mat, Point((right - radius).toDouble(), (bottom - radius).toDouble()), radius, color, -1, Imgproc.LINE_AA, 0)
     }
 
     private fun createCircleXTemplate(): Mat {
@@ -335,10 +351,25 @@ class OpenCvAdIconDetector {
         return mat
     }
 
+    private fun createRoundedRectXTemplate(): Mat {
+        val mat = Mat(64, 64, CvType.CV_8UC1, Scalar(110.0))
+        fillRoundedRect(mat, left = 6, top = 6, right = 58, bottom = 58, radius = 12, color = Scalar(40.0))
+        Imgproc.line(mat, Point(20.0, 20.0), Point(44.0, 44.0), Scalar(255.0), 3, Imgproc.LINE_AA, 0)
+        Imgproc.line(mat, Point(44.0, 20.0), Point(20.0, 44.0), Scalar(255.0), 3, Imgproc.LINE_AA, 0)
+        return mat
+    }
+
     private fun createPlainXTemplate(): Mat {
         val mat = Mat(48, 48, CvType.CV_8UC1, Scalar(35.0))
         Imgproc.line(mat, Point(10.0, 10.0), Point(38.0, 38.0), Scalar(255.0), 4, Imgproc.LINE_AA, 0)
         Imgproc.line(mat, Point(38.0, 10.0), Point(10.0, 38.0), Scalar(255.0), 4, Imgproc.LINE_AA, 0)
+        return mat
+    }
+
+    private fun createThinPlainXTemplate(): Mat {
+        val mat = Mat(48, 48, CvType.CV_8UC1, Scalar(42.0))
+        Imgproc.line(mat, Point(12.0, 12.0), Point(36.0, 36.0), Scalar(255.0), 2, Imgproc.LINE_AA, 0)
+        Imgproc.line(mat, Point(36.0, 12.0), Point(12.0, 36.0), Scalar(255.0), 2, Imgproc.LINE_AA, 0)
         return mat
     }
 
@@ -354,12 +385,33 @@ class OpenCvAdIconDetector {
         return mat
     }
 
+    private fun createRoundedRectDoubleChevronTemplate(): Mat {
+        val mat = Mat(64, 72, CvType.CV_8UC1, Scalar(110.0))
+        fillRoundedRect(mat, left = 5, top = 7, right = 67, bottom = 57, radius = 12, color = Scalar(40.0))
+        // First '>'
+        Imgproc.line(mat, Point(18.0, 21.0), Point(32.0, 32.0), Scalar(255.0), 3, Imgproc.LINE_AA, 0)
+        Imgproc.line(mat, Point(32.0, 32.0), Point(18.0, 43.0), Scalar(255.0), 3, Imgproc.LINE_AA, 0)
+        // Second '>'
+        Imgproc.line(mat, Point(37.0, 21.0), Point(51.0, 32.0), Scalar(255.0), 3, Imgproc.LINE_AA, 0)
+        Imgproc.line(mat, Point(51.0, 32.0), Point(37.0, 43.0), Scalar(255.0), 3, Imgproc.LINE_AA, 0)
+        return mat
+    }
+
     private fun createPlainDoubleChevronTemplate(): Mat {
         val mat = Mat(44, 56, CvType.CV_8UC1, Scalar(35.0))
         Imgproc.line(mat, Point(10.0, 10.0), Point(24.0, 22.0), Scalar(255.0), 4, Imgproc.LINE_AA, 0)
         Imgproc.line(mat, Point(24.0, 22.0), Point(10.0, 34.0), Scalar(255.0), 4, Imgproc.LINE_AA, 0)
         Imgproc.line(mat, Point(29.0, 10.0), Point(43.0, 22.0), Scalar(255.0), 4, Imgproc.LINE_AA, 0)
         Imgproc.line(mat, Point(43.0, 22.0), Point(29.0, 34.0), Scalar(255.0), 4, Imgproc.LINE_AA, 0)
+        return mat
+    }
+
+    private fun createThinPlainDoubleChevronTemplate(): Mat {
+        val mat = Mat(44, 56, CvType.CV_8UC1, Scalar(42.0))
+        Imgproc.line(mat, Point(11.0, 12.0), Point(24.0, 22.0), Scalar(255.0), 2, Imgproc.LINE_AA, 0)
+        Imgproc.line(mat, Point(24.0, 22.0), Point(11.0, 32.0), Scalar(255.0), 2, Imgproc.LINE_AA, 0)
+        Imgproc.line(mat, Point(30.0, 12.0), Point(43.0, 22.0), Scalar(255.0), 2, Imgproc.LINE_AA, 0)
+        Imgproc.line(mat, Point(43.0, 22.0), Point(30.0, 32.0), Scalar(255.0), 2, Imgproc.LINE_AA, 0)
         return mat
     }
 

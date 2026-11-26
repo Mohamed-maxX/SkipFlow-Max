@@ -17,7 +17,8 @@ data class OcrObservation(
 data class OcrAdScanResult(
     val actionTargetBounds: BoundsRect?,
     val matchedKeyword: String?,
-    val hasAdContext: Boolean
+    val hasAdContext: Boolean,
+    val storeExclusionRects: List<BoundsRect> = emptyList()
 )
 
 /**
@@ -52,6 +53,7 @@ object OcrAdTextMatcher {
         "close",
         ">>",
         "> >",
+        ">",
         "×",
         "✕",
         "✖"
@@ -73,6 +75,26 @@ object OcrAdTextMatcher {
         "اغلاق الاعلان"
     )
 
+    fun findStoreRedirectExclusionRects(observations: List<OcrObservation>): List<BoundsRect> {
+        if (observations.isEmpty()) return emptyList()
+        val storeRects = mutableListOf<BoundsRect>()
+        for (obs in observations) {
+            if (obs.confidence in 1f..25f) continue
+            val norm = AdDetectionRules.normalizeText(obs.text, maxLength = 72) ?: continue
+            if (AdDetectionRules.hasStoreRedirectKeyword(null, norm, null)) {
+                storeRects.add(
+                    BoundsRect(
+                        left = obs.bounds.left - 200,
+                        top = obs.bounds.top - 24,
+                        right = obs.bounds.right + 200,
+                        bottom = obs.bounds.bottom + 24
+                    )
+                )
+            }
+        }
+        return storeRects
+    }
+
     fun evaluateObservations(
         observations: List<OcrObservation>,
         screenWidth: Int,
@@ -83,6 +105,9 @@ object OcrAdTextMatcher {
         if (observations.isEmpty() || screenWidth <= 0 || screenHeight <= 0) {
             return OcrAdScanResult(null, null, hasAdContext = isRealAdActivity)
         }
+
+        val storeExclusionRects = findStoreRedirectExclusionRects(observations)
+        val combinedExcludedRects = excludedRects + storeExclusionRects
 
         var hasAdContext = isRealAdActivity
         var bestHighPriority: Pair<OcrObservation, String>? = null
@@ -99,10 +124,11 @@ object OcrAdTextMatcher {
             if (AdDetectionRules.isCountdownText(norm)) continue
             if (!isPlausibleButtonBox(obs.bounds, screenWidth, screenHeight)) continue
             if (AdDetectionRules.hasExcludedCornerKeyword(null, norm, null)) continue
+            if (AdDetectionRules.hasStoreRedirectKeyword(null, norm, null)) continue
             if (OpenCvTemplateEvaluator.isInsideExcludedRect(
                     obs.bounds.centerX.toFloat(),
                     obs.bounds.centerY.toFloat(),
-                    excludedRects
+                    combinedExcludedRects
                 )
             ) {
                 continue
@@ -126,7 +152,8 @@ object OcrAdTextMatcher {
         return OcrAdScanResult(
             actionTargetBounds = winner?.first?.bounds,
             matchedKeyword = winner?.second,
-            hasAdContext = hasAdContext
+            hasAdContext = hasAdContext,
+            storeExclusionRects = storeExclusionRects
         )
     }
 
@@ -140,30 +167,34 @@ object OcrAdTextMatcher {
             return OcrAdScanResult(null, null, hasAdContext = false)
         }
 
+        val storeExclusionRects = findStoreRedirectExclusionRects(observations)
+        val combinedExcludedRects = excludedRects + storeExclusionRects
+
         for (obs in observations) {
             if (obs.confidence in 1f..30f) continue
             val norm = AdDetectionRules.normalizeText(obs.text, maxLength = 32) ?: continue
             if (AdDetectionRules.isCountdownText(norm)) continue
             if (AdDetectionRules.hasExcludedCornerKeyword(null, norm, null)) continue
+            if (AdDetectionRules.hasStoreRedirectKeyword(null, norm, null)) continue
             if (!isPlausibleButtonBox(obs.bounds, screenWidth, screenHeight)) continue
             if (OpenCvTemplateEvaluator.isInsideExcludedRect(
                     obs.bounds.centerX.toFloat(),
                     obs.bounds.centerY.toFloat(),
-                    excludedRects
+                    combinedExcludedRects
                 )
             ) {
                 continue
             }
 
             if (norm == "x") {
-                return OcrAdScanResult(obs.bounds, "X", hasAdContext = true)
+                return OcrAdScanResult(obs.bounds, "X", hasAdContext = true, storeExclusionRects = storeExclusionRects)
             }
             val matched = cornerDualGlyphKeywords.firstOrNull { norm.contains(it, ignoreCase = true) }
             if (matched != null) {
-                return OcrAdScanResult(obs.bounds, matched, hasAdContext = true)
+                return OcrAdScanResult(obs.bounds, matched, hasAdContext = true, storeExclusionRects = storeExclusionRects)
             }
         }
-        return OcrAdScanResult(null, null, hasAdContext = false)
+        return OcrAdScanResult(null, null, hasAdContext = false, storeExclusionRects = storeExclusionRects)
     }
 
     private fun isAdContextText(normalized: String): Boolean {
@@ -299,6 +330,7 @@ class TesseractOcrEngine(
             0 to 0,
             (bmpW - cropW).coerceAtLeast(0) to 0
         )
+        val accumulatedStoreRects = mutableListOf<BoundsRect>()
 
         for ((cropX, cropY) in corners) {
             var cropped: Bitmap? = null
@@ -330,10 +362,11 @@ class TesseractOcrEngine(
                     observations = observations,
                     screenWidth = effectiveScreenW,
                     screenHeight = effectiveScreenH,
-                    excludedRects = excludedRects
+                    excludedRects = excludedRects + accumulatedStoreRects
                 )
+                accumulatedStoreRects.addAll(result.storeExclusionRects)
                 if (result.actionTargetBounds != null) {
-                    return@withLock result
+                    return@withLock result.copy(storeExclusionRects = accumulatedStoreRects.toList())
                 }
             } catch (_: Throwable) {
                 // Continue to remaining corner
@@ -343,7 +376,12 @@ class TesseractOcrEngine(
             }
         }
 
-        return@withLock OcrAdScanResult(null, null, hasAdContext = false)
+        return@withLock OcrAdScanResult(
+            actionTargetBounds = null,
+            matchedKeyword = null,
+            hasAdContext = false,
+            storeExclusionRects = accumulatedStoreRects.toList()
+        )
     }
 
     private fun runOcrPass(
