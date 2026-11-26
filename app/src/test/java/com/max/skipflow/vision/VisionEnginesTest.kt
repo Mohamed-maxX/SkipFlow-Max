@@ -221,5 +221,26 @@ class VisionEnginesTest {
             screenHeight = screenH
         )
         assertNull(splitPillResult.actionTargetBounds)
+
+        // Split "GetApps" + ">" or "تثبيت" + ">>" must also be ignored
+        val getAppsSplitPill = OcrAdTextMatcher.evaluateCornerObservations(
+            observations = listOf(
+                OcrObservation("GetApps", BoundsRect(60, 95, 210, 155), 85f),
+                OcrObservation(">", BoundsRect(225, 95, 275, 155), 84f)
+            ),
+            screenWidth = screenW,
+            screenHeight = screenH
+        )
+        assertNull(getAppsSplitPill.actionTargetBounds)
+
+        val installSplitPill = OcrAdTextMatcher.evaluateCornerObservations(
+            observations = listOf(
+                OcrObservation("تثبيت", BoundsRect(60, 95, 170, 155), 86f),
+                OcrObservation(">>", BoundsRect(185, 95, 245, 155), 84f)
+            ),
+            screenWidth = screenW,
+            screenHeight = screenH
+        )
+        assertNull(installSplitPill.actionTargetBounds)
     }
 }

@@ -295,5 +295,12 @@ class AdDetectionRulesTest {
                 isAdActivityContext = true
             )
         )
+
+        // Chooser / store picker detection helpers
+        assertTrue(AdDetectionRules.isAppChooserPackageOrActivity("android", "com.android.internal.app.ResolverActivity"))
+        assertTrue(AdDetectionRules.isAppChooserPackageOrActivity("com.android.intentresolver", "ChooserActivity"))
+        assertTrue(AdDetectionRules.hasStorePickerDialogText("حدد متجر تطبيقات", null))
+        assertTrue(AdDetectionRules.hasStorePickerDialogText("متجر Play", "GetApps"))
+        assertFalse(AdDetectionRules.isAppChooserPackageOrActivity("com.game.play", "TTRewardExpressVideoActivity"))
     }
 }

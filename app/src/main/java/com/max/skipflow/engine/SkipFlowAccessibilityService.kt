@@ -659,7 +659,8 @@ class SkipFlowAccessibilityService : AccessibilityService() {
 
             // Strict Gate: Only run OpenCV directly on Confirmed AdActivity or explicit A11y ad text;
             // on unconfirmed WebView/sparse containers (never on UnityPlayer gameplay), allow OCR text check only.
-            if (shouldAttemptVisionFallback(
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R &&
+                shouldAttemptVisionFallback(
                     monitoredPackage = monitoredPackage,
                     isRealAdActivity = realAdActivityActive,
                     hasExplicitAdTreeText = hasExplicitAdTreeText,
@@ -851,7 +852,8 @@ class SkipFlowAccessibilityService : AccessibilityService() {
             // If OpenCV spotted a `>>` chevron, verify via Corner OCR that it isn't part of a
             // pure-canvas/WebView "Google Play >>" / "Install >>" store redirect pill.
             var precomputedCornerOcr: com.max.skipflow.vision.OcrAdScanResult? = null
-            if (ocvSummary.detection?.shape == DetectedIconShape.DOUBLE_CHEVRON) {
+            val chevronHit = ocvSummary.detection
+            if (chevronHit != null && chevronHit.shape == DetectedIconShape.DOUBLE_CHEVRON) {
                 val cornerOcr = tesseractOcrEngine.recognizeCornerControls(
                     softwareScreenshot = softwareBitmap,
                     screenWidth = screenW,
@@ -861,8 +863,7 @@ class SkipFlowAccessibilityService : AccessibilityService() {
                 precomputedCornerOcr = cornerOcr
                 if (cornerOcr.storeExclusionRects.isNotEmpty()) {
                     effectiveExcludedRects = effectiveExcludedRects + cornerOcr.storeExclusionRects
-                    val hit = ocvSummary.detection
-                    if (hit != null && OpenCvTemplateEvaluator.isInsideExcludedRect(hit.centerX, hit.centerY, effectiveExcludedRects)) {
+                    if (OpenCvTemplateEvaluator.isInsideExcludedRect(chevronHit.centerX, chevronHit.centerY, effectiveExcludedRects)) {
                         ocvSummary = openCvAdIconDetector.detectCornerCloseIcon(
                             softwareScreenshot = softwareBitmap,
                             screenWidth = screenW,
