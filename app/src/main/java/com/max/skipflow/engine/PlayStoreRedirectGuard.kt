@@ -1,10 +1,18 @@
 package com.max.skipflow.engine
 
+data class TappedSkipCandidateInfo(
+    val packageName: String,
+    val activityName: String?,
+    val normCenterX: Float,
+    val normCenterY: Float,
+    val viewId: String?
+)
+
 /**
  * Guards against accidental ad-click or auto-redirect escapes into Google Play Store (`com.android.vending`)
  * or Android's app chooser / store picker (`android` / `ResolverActivity` / `ChooserActivity` /
  * `"متجر Play"` / `"GetApps"` / `"حدد متجر تطبيقات"`), triggering a single `GLOBAL_ACTION_BACK`
- * to dismiss the picker or store and return seamlessly.
+ * and returning metadata of the offending tap so Fake-X Learning can blacklist that trap for 24h.
  */
 class PlayStoreRedirectGuard(
     private val redirectWindowMs: Long = REDIRECT_WINDOW_MS,
@@ -12,13 +20,23 @@ class PlayStoreRedirectGuard(
 ) {
     private var lastAttemptAtMs: Long = 0L
     private var lastAttemptPackage: String? = null
+    private var lastAttemptInfo: TappedSkipCandidateInfo? = null
     private var bouncedForCurrentAttempt: Boolean = false
+    private var lastRedirectedTrapInfo: TappedSkipCandidateInfo? = null
 
     private var lastAdActiveAtMs: Long = 0L
     private var lastAdPackage: String? = null
     private var lastChooserBounceAtMs: Long = 0L
 
-    fun recordGameOrAdSkipAttempt(packageName: String, nowMs: Long) {
+    fun recordGameOrAdSkipAttempt(
+        packageName: String,
+        nowMs: Long,
+        activityName: String? = null,
+        bounds: BoundsRect? = null,
+        screenWidth: Int = 0,
+        screenHeight: Int = 0,
+        viewId: String? = null
+    ) {
         if (packageName == AdDetectionRules.YOUTUBE_PACKAGE ||
             AdDetectionRules.isStrictlyExcludedPackage(packageName)
         ) {
@@ -27,6 +45,23 @@ class PlayStoreRedirectGuard(
         lastAttemptAtMs = nowMs
         lastAttemptPackage = packageName
         bouncedForCurrentAttempt = false
+        lastAttemptInfo = if (bounds != null && screenWidth > 0 && screenHeight > 0) {
+            TappedSkipCandidateInfo(
+                packageName = packageName,
+                activityName = activityName,
+                normCenterX = bounds.centerX.toFloat() / screenWidth.toFloat(),
+                normCenterY = bounds.centerY.toFloat() / screenHeight.toFloat(),
+                viewId = viewId
+            )
+        } else {
+            null
+        }
+    }
+
+    fun consumeRedirectedTapInfo(): TappedSkipCandidateInfo? {
+        val info = lastRedirectedTrapInfo
+        lastRedirectedTrapInfo = null
+        return info
     }
 
     fun markActiveAdContext(packageName: String, nowMs: Long) {
@@ -47,6 +82,8 @@ class PlayStoreRedirectGuard(
     fun clearOnLauncherOrUserExit() {
         lastAttemptAtMs = 0L
         lastAttemptPackage = null
+        lastAttemptInfo = null
+        lastRedirectedTrapInfo = null
         bouncedForCurrentAttempt = false
         lastAdActiveAtMs = 0L
         lastAdPackage = null
@@ -76,6 +113,7 @@ class PlayStoreRedirectGuard(
             if (withinSkipAttempt) {
                 bouncedForCurrentAttempt = true
                 lastChooserBounceAtMs = nowMs
+                lastRedirectedTrapInfo = lastAttemptInfo
                 return true
             }
             return false
@@ -89,6 +127,7 @@ class PlayStoreRedirectGuard(
         if (withinSkipAttempt || isWithinActiveAdWindow(nowMs)) {
             bouncedForCurrentAttempt = true
             lastChooserBounceAtMs = nowMs
+            lastRedirectedTrapInfo = if (withinSkipAttempt) lastAttemptInfo else null
             return true
         }
         return false

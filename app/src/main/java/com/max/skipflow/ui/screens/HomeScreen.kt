@@ -34,8 +34,10 @@ import androidx.compose.material.icons.rounded.BatterySaver
 import androidx.compose.material.icons.rounded.Bolt
 import androidx.compose.material.icons.rounded.CheckCircle
 import androidx.compose.material.icons.rounded.ErrorOutline
+import androidx.compose.material.icons.rounded.PlayArrow
 import androidx.compose.material.icons.rounded.PowerSettingsNew
 import androidx.compose.material.icons.rounded.Shield
+import androidx.compose.material.icons.rounded.Snooze
 import androidx.compose.material.icons.rounded.Timer
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -60,6 +62,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.max.skipflow.BuildConfig
+import com.max.skipflow.engine.ServiceNotificationManager
 import com.max.skipflow.ui.MainUiState
 import com.max.skipflow.ui.theme.SkipFlowColors
 import com.max.skipflow.ui.theme.formatSavedTimeArabic
@@ -68,12 +71,15 @@ import com.max.skipflow.ui.theme.formatSavedTimeArabic
 fun HomeScreen(
     uiState: MainUiState,
     onToggleEngine: () -> Unit,
+    onStartSnooze: () -> Unit,
+    onCancelSnooze: () -> Unit,
     onFixAccessibility: () -> Unit,
     onFixBatteryOptimization: () -> Unit,
     onNavigateToApps: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     val isEngineFullyActive = uiState.settings.engineEnabled &&
+        uiState.snoozeRemainingMs <= 0L &&
         uiState.healthStatus.isAccessibilityHealthy &&
         !(uiState.settings.pauseDuringCalls && uiState.isCallInProgress)
 
@@ -89,9 +95,12 @@ fun HomeScreen(
 
         HeroPowerControl(
             engineEnabled = uiState.settings.engineEnabled,
+            snoozeRemainingMs = uiState.snoozeRemainingMs,
             isAccessibilityHealthy = uiState.healthStatus.isAccessibilityHealthy,
             isCallPaused = uiState.settings.pauseDuringCalls && uiState.isCallInProgress,
-            onToggleEngine = onToggleEngine
+            onToggleEngine = onToggleEngine,
+            onStartSnooze = onStartSnooze,
+            onCancelSnooze = onCancelSnooze
         )
 
         LiveStatsRow(
@@ -198,11 +207,15 @@ private fun HomeHeader(
 @Composable
 private fun HeroPowerControl(
     engineEnabled: Boolean,
+    snoozeRemainingMs: Long,
     isAccessibilityHealthy: Boolean,
     isCallPaused: Boolean,
-    onToggleEngine: () -> Unit
+    onToggleEngine: () -> Unit,
+    onStartSnooze: () -> Unit,
+    onCancelSnooze: () -> Unit
 ) {
-    val activeVisual = engineEnabled && isAccessibilityHealthy && !isCallPaused
+    val isSnoozed = snoozeRemainingMs > 0L
+    val activeVisual = engineEnabled && !isSnoozed && isAccessibilityHealthy && !isCallPaused
     val infiniteTransition = rememberInfiniteTransition(label = "power_pulse")
     val pulseScale by infiniteTransition.animateFloat(
         initialValue = 1.0f,
@@ -216,6 +229,7 @@ private fun HeroPowerControl(
 
     val ringColor by animateColorAsState(
         targetValue = when {
+            isSnoozed -> SkipFlowColors.WarningAmber
             activeVisual -> SkipFlowColors.ElectricCyan
             engineEnabled && !isAccessibilityHealthy -> SkipFlowColors.AlertRed
             engineEnabled && isCallPaused -> SkipFlowColors.WarningAmber
@@ -291,11 +305,19 @@ private fun HeroPowerControl(
                         Icon(
                             imageVector = Icons.Rounded.PowerSettingsNew,
                             contentDescription = "تشغيل أو إيقاف المحرك",
-                            tint = if (engineEnabled) SkipFlowColors.ElectricCyan else SkipFlowColors.TextSecondary,
+                            tint = when {
+                                isSnoozed -> SkipFlowColors.WarningAmber
+                                engineEnabled -> SkipFlowColors.ElectricCyan
+                                else -> SkipFlowColors.TextSecondary
+                            },
                             modifier = Modifier.size(46.dp)
                         )
                         Text(
-                            text = if (engineEnabled) "مُفعّل" else "متوقف",
+                            text = when {
+                                isSnoozed -> "غفوة مؤقتة"
+                                engineEnabled -> "مُفعّل"
+                                else -> "متوقف"
+                            },
                             fontSize = 15.sp,
                             fontWeight = FontWeight.Bold,
                             color = if (engineEnabled) SkipFlowColors.TextPrimary else SkipFlowColors.TextSecondary
@@ -306,14 +328,61 @@ private fun HeroPowerControl(
 
             Text(
                 text = when {
+                    isSnoozed -> "إيقاف مؤقت: سيعود المحرك تلقائياً خلال ${ServiceNotificationManager.formatCountdown(snoozeRemainingMs)}"
                     !engineEnabled -> "المحرك متوقف حالياً — اضغط للتشغيل"
                     !isAccessibilityHealthy -> "المحرك جاهز — يرجى تفعيل خدمة إمكانية الوصول أدناه"
                     isCallPaused -> "تم الإيقاف مؤقتاً لوجود مكالمة جارية"
                     else -> "تخطي الإعلانات تلقائياً مفعّل بنجاح"
                 },
                 style = MaterialTheme.typography.bodyMedium,
-                color = if (activeVisual) SkipFlowColors.ElectricCyan else SkipFlowColors.TextSecondary
+                color = when {
+                    isSnoozed -> SkipFlowColors.WarningAmber
+                    activeVisual -> SkipFlowColors.ElectricCyan
+                    else -> SkipFlowColors.TextSecondary
+                }
             )
+
+            if (isSnoozed) {
+                Button(
+                    onClick = onCancelSnooze,
+                    shape = RoundedCornerShape(14.dp),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = SkipFlowColors.ElectricBlue,
+                        contentColor = Color.White
+                    )
+                ) {
+                    Icon(
+                        imageVector = Icons.Rounded.PlayArrow,
+                        contentDescription = null,
+                        modifier = Modifier.size(18.dp)
+                    )
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text(
+                        text = "استئناف الآن (${ServiceNotificationManager.formatCountdown(snoozeRemainingMs)})",
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+            } else if (engineEnabled) {
+                OutlinedButton(
+                    onClick = onStartSnooze,
+                    shape = RoundedCornerShape(14.dp),
+                    border = BorderStroke(1.dp, SkipFlowColors.WarningAmber.copy(alpha = 0.55f)),
+                    colors = ButtonDefaults.outlinedButtonColors(
+                        contentColor = SkipFlowColors.WarningAmber
+                    )
+                ) {
+                    Icon(
+                        imageVector = Icons.Rounded.Snooze,
+                        contentDescription = null,
+                        modifier = Modifier.size(18.dp)
+                    )
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text(
+                        text = "إيقاف مؤقت 10 دقائق",
+                        fontWeight = FontWeight.SemiBold
+                    )
+                }
+            }
         }
     }
 }

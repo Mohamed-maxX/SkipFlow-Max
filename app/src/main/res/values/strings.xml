@@ -3,4 +3,5 @@
     <string name="app_name">SkipFlow Max</string>
     <string name="accessibility_service_label">محرك SkipFlow Max لتخطي الإعلانات</string>
     <string name="accessibility_service_description">يتيح لتطبيق SkipFlow Max اكتشاف أزرار تخطي الإعلانات وإغلاقها تلقائياً داخل التطبيقات المحددة فقط مع الحفاظ على وضع الخمول التام في بقية التطبيقات.</string>
+    <string name="quick_tile_label">SkipFlow Max</string>
 </resources>

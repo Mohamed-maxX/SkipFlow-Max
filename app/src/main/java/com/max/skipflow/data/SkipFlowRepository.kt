@@ -3,10 +3,15 @@ package com.max.skipflow.data
 import android.content.Context
 import android.content.SharedPreferences
 import com.max.skipflow.engine.AdDetectionRules
+import com.max.skipflow.engine.BoundsRect
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import java.net.URLDecoder
+import java.net.URLEncoder
+import java.nio.charset.StandardCharsets
 import java.time.LocalDate
+import kotlin.math.abs
 
 interface KeyValueStorage {
     fun getBoolean(key: String, defaultValue: Boolean): Boolean
@@ -62,7 +67,8 @@ class SharedPreferencesStorage(
 
 class SkipFlowRepository(
     private val storage: KeyValueStorage,
-    private val todayProvider: () -> String = { LocalDate.now().toString() }
+    private val todayProvider: () -> String = { LocalDate.now().toString() },
+    private val clockProvider: () -> Long = { System.currentTimeMillis() }
 ) {
     constructor(context: Context) : this(
         storage = SharedPreferencesStorage(
@@ -82,6 +88,14 @@ class SkipFlowRepository(
     private val _stats = MutableStateFlow(loadStatsForToday())
     val stats: StateFlow<DailyStats> = _stats.asStateFlow()
 
+    private val _snoozeUntilEpochMs = MutableStateFlow(loadInitialSnoozeUntil())
+    val snoozeUntilEpochMs: StateFlow<Long> = _snoozeUntilEpochMs.asStateFlow()
+
+    private val _skipLogs = MutableStateFlow(loadInitialSkipLogs())
+    val skipLogs: StateFlow<List<SkipLogEntry>> = _skipLogs.asStateFlow()
+
+    private var fakeXTraps: MutableList<FakeXTrapRecord> = loadInitialFakeXTraps().toMutableList()
+
     private fun loadInitialSettings(): SkipFlowSettings {
         return SkipFlowSettings(
             engineEnabled = storage.getBoolean(KEY_ENGINE_ENABLED, true),
@@ -90,7 +104,10 @@ class SkipFlowRepository(
             toastOnSkip = storage.getBoolean(KEY_TOAST_ON_SKIP, true),
             pauseDuringCalls = storage.getBoolean(KEY_PAUSE_DURING_CALLS, true),
             bounceBackFromPlayStore = storage.getBoolean(KEY_BOUNCE_BACK_PLAY_STORE, true),
-            liveDebugOverlayEnabled = storage.getBoolean(KEY_LIVE_DEBUG_OVERLAY, true)
+            liveDebugOverlayEnabled = storage.getBoolean(KEY_LIVE_DEBUG_OVERLAY, true),
+            adCurtainEnabled = storage.getBoolean(KEY_AD_CURTAIN_ENABLED, false),
+            autoSwipeSocialAdsEnabled = storage.getBoolean(KEY_AUTO_SWIPE_SOCIAL_ADS, true),
+            annoyanceKillerEnabled = storage.getBoolean(KEY_ANNOYANCE_KILLER_ENABLED, false)
         )
     }
 
@@ -121,10 +138,79 @@ class SkipFlowRepository(
         )
     }
 
+    private fun loadInitialSnoozeUntil(): Long {
+        val stored = storage.getLong(KEY_SNOOZE_UNTIL_EPOCH_MS, 0L)
+        return if (stored > clockProvider()) stored else {
+            if (stored != 0L) storage.putLong(KEY_SNOOZE_UNTIL_EPOCH_MS, 0L)
+            0L
+        }
+    }
+
+    private fun loadInitialSkipLogs(): List<SkipLogEntry> {
+        val raw = storage.getString(KEY_SKIP_LOGS_JSON, null) ?: return emptyList()
+        if (raw.isBlank() || raw == "[]") return emptyList()
+        return raw.lineSequence()
+            .filter { it.isNotBlank() }
+            .take(MAX_SKIP_LOGS)
+            .mapNotNull { line ->
+                val parts = line.split('|')
+                if (parts.size < 6) return@mapNotNull null
+                val id = parts[0].toLongOrNull() ?: return@mapNotNull null
+                val pkg = decodeField(parts[1]).trim()
+                if (pkg.isEmpty()) return@mapNotNull null
+                val appName = decodeField(parts[2]).ifBlank { pkg }
+                val ts = parts[3].toLongOrNull() ?: 0L
+                val method = runCatching { SkipDetectionMethod.valueOf(parts[4]) }
+                    .getOrDefault(SkipDetectionMethod.ACCESSIBILITY)
+                val detail = decodeField(parts[5])
+                SkipLogEntry(
+                    id = id,
+                    packageName = pkg,
+                    appName = appName,
+                    timestampMs = ts,
+                    method = method,
+                    detail = detail
+                )
+            }
+            .toList()
+    }
+
+    private fun loadInitialFakeXTraps(): List<FakeXTrapRecord> {
+        val raw = storage.getString(KEY_FAKE_X_TRAPS_JSON, null) ?: return emptyList()
+        if (raw.isBlank() || raw == "[]") return emptyList()
+        val cutoff = clockProvider() - FAKE_X_TTL_MS
+        return raw.lineSequence()
+            .filter { it.isNotBlank() }
+            .take(MAX_FAKE_X_TRAPS)
+            .mapNotNull { line ->
+                val parts = line.split('|')
+                if (parts.size < 6) return@mapNotNull null
+                val pkg = decodeField(parts[0]).trim()
+                if (pkg.isEmpty()) return@mapNotNull null
+                val recordedAt = parts[5].toLongOrNull() ?: return@mapNotNull null
+                if (recordedAt < cutoff) return@mapNotNull null
+                val nx = parts[2].toFloatOrNull() ?: return@mapNotNull null
+                val ny = parts[3].toFloatOrNull() ?: return@mapNotNull null
+                FakeXTrapRecord(
+                    packageName = pkg,
+                    activityName = decodeField(parts[1]),
+                    normCenterX = nx,
+                    normCenterY = ny,
+                    viewId = decodeField(parts[4]).takeIf { it.isNotBlank() },
+                    recordedAtWallMs = recordedAt
+                )
+            }
+            .toList()
+    }
+
     fun setEngineEnabled(enabled: Boolean) {
         synchronized(lock) {
             storage.putBoolean(KEY_ENGINE_ENABLED, enabled)
             _settings.value = _settings.value.copy(engineEnabled = enabled)
+            if (!enabled) {
+                storage.putLong(KEY_SNOOZE_UNTIL_EPOCH_MS, 0L)
+                _snoozeUntilEpochMs.value = 0L
+            }
         }
     }
 
@@ -170,6 +256,56 @@ class SkipFlowRepository(
         }
     }
 
+    fun setAdCurtainEnabled(enabled: Boolean) {
+        synchronized(lock) {
+            storage.putBoolean(KEY_AD_CURTAIN_ENABLED, enabled)
+            _settings.value = _settings.value.copy(adCurtainEnabled = enabled)
+        }
+    }
+
+    fun setAutoSwipeSocialAdsEnabled(enabled: Boolean) {
+        synchronized(lock) {
+            storage.putBoolean(KEY_AUTO_SWIPE_SOCIAL_ADS, enabled)
+            _settings.value = _settings.value.copy(autoSwipeSocialAdsEnabled = enabled)
+        }
+    }
+
+    fun setAnnoyanceKillerEnabled(enabled: Boolean) {
+        synchronized(lock) {
+            storage.putBoolean(KEY_ANNOYANCE_KILLER_ENABLED, enabled)
+            _settings.value = _settings.value.copy(annoyanceKillerEnabled = enabled)
+        }
+    }
+
+    fun startSmartSnooze(durationMs: Long = DEFAULT_SNOOZE_DURATION_MS): Long {
+        synchronized(lock) {
+            val until = clockProvider() + durationMs.coerceAtLeast(1_000L)
+            storage.putLong(KEY_SNOOZE_UNTIL_EPOCH_MS, until)
+            _snoozeUntilEpochMs.value = until
+            return until
+        }
+    }
+
+    fun cancelSmartSnooze() {
+        synchronized(lock) {
+            storage.putLong(KEY_SNOOZE_UNTIL_EPOCH_MS, 0L)
+            _snoozeUntilEpochMs.value = 0L
+        }
+    }
+
+    fun getSnoozeRemainingMs(): Long {
+        val until = _snoozeUntilEpochMs.value
+        if (until <= 0L) return 0L
+        val remaining = until - clockProvider()
+        if (remaining <= 0L) {
+            cancelSmartSnooze()
+            return 0L
+        }
+        return remaining
+    }
+
+    fun isSnoozed(): Boolean = getSnoozeRemainingMs() > 0L
+
     fun setPackageEnabled(packageName: String, enabled: Boolean) {
         synchronized(lock) {
             val updated = _disabledPackages.value.toMutableSet()
@@ -190,6 +326,181 @@ class SkipFlowRepository(
             return false
         }
         return packageName !in _disabledPackages.value
+    }
+
+    fun recordSkipLog(
+        packageName: String,
+        appName: String,
+        method: SkipDetectionMethod,
+        detail: String
+    ) {
+        synchronized(lock) {
+            val now = clockProvider()
+            val entry = SkipLogEntry(
+                id = now * 31L + (_skipLogs.value.size + 1),
+                packageName = packageName,
+                appName = appName.ifBlank { packageName },
+                timestampMs = now,
+                method = method,
+                detail = detail
+            )
+            val updated = (listOf(entry) + _skipLogs.value).take(MAX_SKIP_LOGS)
+            _skipLogs.value = updated
+            persistSkipLogsLocked(updated)
+        }
+    }
+
+    fun clearSkipLogs() {
+        synchronized(lock) {
+            _skipLogs.value = emptyList()
+            storage.putString(KEY_SKIP_LOGS_JSON, "")
+        }
+    }
+
+    private fun persistSkipLogsLocked(logs: List<SkipLogEntry>) {
+        val encoded = logs.take(MAX_SKIP_LOGS).joinToString("\n") { entry ->
+            listOf(
+                entry.id.toString(),
+                encodeField(entry.packageName),
+                encodeField(entry.appName),
+                entry.timestampMs.toString(),
+                entry.method.name,
+                encodeField(entry.detail)
+            ).joinToString("|")
+        }
+        storage.putString(KEY_SKIP_LOGS_JSON, encoded)
+    }
+
+    fun recordFakeXTrap(
+        packageName: String,
+        activityName: String?,
+        normCenterX: Float,
+        normCenterY: Float,
+        viewId: String?
+    ) {
+        if (packageName.isBlank()) return
+        synchronized(lock) {
+            val now = clockProvider()
+            pruneExpiredTrapsLocked(now)
+            val normalizedAct = activityName?.trim().orEmpty()
+            val normalizedVid = viewId?.trim()?.takeIf { it.isNotBlank() }
+
+            fakeXTraps.removeAll { existing ->
+                existing.packageName == packageName &&
+                    existing.activityName == normalizedAct &&
+                    ((normalizedVid != null && existing.viewId == normalizedVid) ||
+                        (abs(existing.normCenterX - normCenterX) <= FAKE_X_NORM_TOLERANCE &&
+                            abs(existing.normCenterY - normCenterY) <= FAKE_X_NORM_TOLERANCE))
+            }
+
+            fakeXTraps.add(
+                0,
+                FakeXTrapRecord(
+                    packageName = packageName,
+                    activityName = normalizedAct,
+                    normCenterX = normCenterX.coerceIn(0f, 1f),
+                    normCenterY = normCenterY.coerceIn(0f, 1f),
+                    viewId = normalizedVid,
+                    recordedAtWallMs = now
+                )
+            )
+            if (fakeXTraps.size > MAX_FAKE_X_TRAPS) {
+                fakeXTraps = fakeXTraps.take(MAX_FAKE_X_TRAPS).toMutableList()
+            }
+            persistFakeXTrapsLocked()
+        }
+    }
+
+    fun isKnownFakeXTrap(
+        packageName: String,
+        activityName: String?,
+        bounds: BoundsRect,
+        screenWidth: Int,
+        screenHeight: Int,
+        viewId: String?
+    ): Boolean {
+        if (screenWidth <= 0 || screenHeight <= 0) return false
+        val normX = bounds.centerX.toFloat() / screenWidth.toFloat()
+        val normY = bounds.centerY.toFloat() / screenHeight.toFloat()
+        val normalizedAct = activityName?.trim().orEmpty()
+        val normalizedVid = viewId?.trim()?.takeIf { it.isNotBlank() }
+
+        synchronized(lock) {
+            val now = clockProvider()
+            if (pruneExpiredTrapsLocked(now)) {
+                persistFakeXTrapsLocked()
+            }
+            return fakeXTraps.any { trap ->
+                trap.packageName == packageName &&
+                    (trap.activityName.isEmpty() || normalizedAct.isEmpty() || trap.activityName == normalizedAct) &&
+                    ((normalizedVid != null && trap.viewId == normalizedVid) ||
+                        (abs(trap.normCenterX - normX) <= FAKE_X_NORM_TOLERANCE &&
+                            abs(trap.normCenterY - normY) <= FAKE_X_NORM_TOLERANCE))
+            }
+        }
+    }
+
+    fun getFakeXTrapExclusionRects(
+        packageName: String,
+        activityName: String?,
+        screenWidth: Int,
+        screenHeight: Int
+    ): List<BoundsRect> {
+        if (screenWidth <= 0 || screenHeight <= 0) return emptyList()
+        val normalizedAct = activityName?.trim().orEmpty()
+        val halfBoxW = (screenWidth * FAKE_X_NORM_TOLERANCE).toInt().coerceAtLeast(36)
+        val halfBoxH = (screenHeight * FAKE_X_NORM_TOLERANCE).toInt().coerceAtLeast(36)
+
+        synchronized(lock) {
+            val now = clockProvider()
+            if (pruneExpiredTrapsLocked(now)) {
+                persistFakeXTrapsLocked()
+            }
+            return fakeXTraps.filter { trap ->
+                trap.packageName == packageName &&
+                    (trap.activityName.isEmpty() || normalizedAct.isEmpty() || trap.activityName == normalizedAct)
+            }.map { trap ->
+                val cx = (trap.normCenterX * screenWidth).toInt()
+                val cy = (trap.normCenterY * screenHeight).toInt()
+                BoundsRect(
+                    left = (cx - halfBoxW).coerceAtLeast(0),
+                    top = (cy - halfBoxH).coerceAtLeast(0),
+                    right = (cx + halfBoxW).coerceAtMost(screenWidth),
+                    bottom = (cy + halfBoxH).coerceAtMost(screenHeight)
+                )
+            }
+        }
+    }
+
+    private fun pruneExpiredTrapsLocked(nowMs: Long): Boolean {
+        val cutoff = nowMs - FAKE_X_TTL_MS
+        val before = fakeXTraps.size
+        fakeXTraps.removeAll { it.recordedAtWallMs < cutoff }
+        return fakeXTraps.size != before
+    }
+
+    private fun persistFakeXTrapsLocked() {
+        val encoded = fakeXTraps.take(MAX_FAKE_X_TRAPS).joinToString("\n") { trap ->
+            listOf(
+                encodeField(trap.packageName),
+                encodeField(trap.activityName),
+                trap.normCenterX.toString(),
+                trap.normCenterY.toString(),
+                encodeField(trap.viewId.orEmpty()),
+                trap.recordedAtWallMs.toString()
+            ).joinToString("|")
+        }
+        storage.putString(KEY_FAKE_X_TRAPS_JSON, encoded)
+    }
+
+    private fun encodeField(raw: String): String {
+        return URLEncoder.encode(raw, StandardCharsets.UTF_8.name())
+    }
+
+    private fun decodeField(encoded: String): String {
+        return runCatching {
+            URLDecoder.decode(encoded, StandardCharsets.UTF_8.name())
+        }.getOrDefault(encoded)
     }
 
     fun refreshDateRolloverIfNeeded() {
@@ -233,10 +544,22 @@ class SkipFlowRepository(
         private const val KEY_PAUSE_DURING_CALLS = "pause_during_calls"
         private const val KEY_BOUNCE_BACK_PLAY_STORE = "bounce_back_play_store"
         private const val KEY_LIVE_DEBUG_OVERLAY = "live_debug_overlay_enabled"
+        private const val KEY_AD_CURTAIN_ENABLED = "ad_curtain_enabled"
+        private const val KEY_AUTO_SWIPE_SOCIAL_ADS = "auto_swipe_social_ads_enabled"
+        private const val KEY_ANNOYANCE_KILLER_ENABLED = "annoyance_killer_enabled"
+        private const val KEY_SNOOZE_UNTIL_EPOCH_MS = "snooze_until_epoch_ms"
+        private const val KEY_SKIP_LOGS_JSON = "skip_logs_json"
+        private const val KEY_FAKE_X_TRAPS_JSON = "fake_x_traps_json"
         private const val KEY_BLACKLIST_INITIALIZED = "blacklist_mode_initialized"
         private const val KEY_DISABLED_PACKAGES = "disabled_packages"
         private const val KEY_STATS_DATE = "stats_date"
         private const val KEY_SKIPPED_TODAY = "skipped_today"
         private const val KEY_SAVED_SECONDS_TODAY = "saved_seconds_today"
+
+        const val DEFAULT_SNOOZE_DURATION_MS = 10 * 60 * 1000L
+        const val MAX_SKIP_LOGS = 50
+        const val MAX_FAKE_X_TRAPS = 100
+        const val FAKE_X_TTL_MS = 24 * 60 * 60 * 1000L
+        const val FAKE_X_NORM_TOLERANCE = 0.06f
     }
 }

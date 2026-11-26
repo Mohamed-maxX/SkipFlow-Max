@@ -1,18 +1,25 @@
 package com.max.skipflow
 
+import android.Manifest
+import android.content.pm.PackageManager
 import android.graphics.Color as AndroidColor
+import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.SystemBarStyle
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
+import androidx.core.content.ContextCompat
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Apps
+import androidx.compose.material.icons.rounded.History
 import androidx.compose.material.icons.rounded.Home
 import androidx.compose.material.icons.rounded.Settings
 import androidx.compose.material3.HorizontalDivider
@@ -24,6 +31,7 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -39,6 +47,7 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.max.skipflow.ui.MainViewModel
+import com.max.skipflow.ui.screens.ActivityLogScreen
 import com.max.skipflow.ui.screens.AppsScreen
 import com.max.skipflow.ui.screens.HomeScreen
 import com.max.skipflow.ui.screens.SettingsScreen
@@ -51,6 +60,7 @@ private enum class SkipFlowTab(
 ) {
     HOME("الرئيسية", Icons.Rounded.Home),
     APPS("التطبيقات", Icons.Rounded.Apps),
+    ACTIVITY_LOG("سجل النشاط", Icons.Rounded.History),
     SETTINGS("الإعدادات", Icons.Rounded.Settings)
 }
 
@@ -78,6 +88,27 @@ private fun SkipFlowAppShell(viewModel: MainViewModel) {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
     var selectedTab by rememberSaveable { mutableStateOf(SkipFlowTab.HOME) }
+    var askedNotificationPermission by rememberSaveable { mutableStateOf(false) }
+
+    val notificationPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission()
+    ) { _ ->
+        com.max.skipflow.engine.SkipFlowAccessibilityService.notifyControlStateChanged(context)
+    }
+
+    LaunchedEffect(uiState.isServiceConnected, askedNotificationPermission) {
+        if (!askedNotificationPermission &&
+            uiState.isServiceConnected &&
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            ContextCompat.checkSelfPermission(
+                context,
+                Manifest.permission.POST_NOTIFICATIONS
+            ) != PackageManager.PERMISSION_GRANTED
+        ) {
+            askedNotificationPermission = true
+            notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+        }
+    }
 
     DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
@@ -117,7 +148,8 @@ private fun SkipFlowAppShell(viewModel: MainViewModel) {
                             label = {
                                 Text(
                                     text = tab.title,
-                                    fontSize = 12.sp,
+                                    fontSize = 11.sp,
+                                    maxLines = 1,
                                     fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Medium
                                 )
                             },
@@ -139,6 +171,8 @@ private fun SkipFlowAppShell(viewModel: MainViewModel) {
                 HomeScreen(
                     uiState = uiState,
                     onToggleEngine = viewModel::toggleMasterEngine,
+                    onStartSnooze = viewModel::startSmartSnooze,
+                    onCancelSnooze = viewModel::cancelSmartSnooze,
                     onFixAccessibility = { viewModel.openAccessibilitySettings(context) },
                     onFixBatteryOptimization = { viewModel.requestBatteryOptimizationExemption(context) },
                     onNavigateToApps = { selectedTab = SkipFlowTab.APPS },
@@ -157,6 +191,16 @@ private fun SkipFlowAppShell(viewModel: MainViewModel) {
                 )
             }
 
+            SkipFlowTab.ACTIVITY_LOG -> {
+                ActivityLogScreen(
+                    logs = uiState.skipLogs,
+                    disabledPackages = uiState.disabledPackages,
+                    onDisableApp = { pkg -> viewModel.setPackageEnabled(pkg, false) },
+                    onClearLogs = viewModel::clearSkipLogs,
+                    modifier = Modifier.padding(innerPadding)
+                )
+            }
+
             SkipFlowTab.SETTINGS -> {
                 SettingsScreen(
                     uiState = uiState,
@@ -168,6 +212,9 @@ private fun SkipFlowAppShell(viewModel: MainViewModel) {
                     onLiveDebugOverlayChanged = { enabled ->
                         viewModel.setLiveDebugOverlayEnabled(context, enabled)
                     },
+                    onAdCurtainChanged = viewModel::setAdCurtainEnabled,
+                    onAutoSwipeSocialAdsChanged = viewModel::setAutoSwipeSocialAdsEnabled,
+                    onAnnoyanceKillerChanged = viewModel::setAnnoyanceKillerEnabled,
                     onRequestOverlayPermission = { viewModel.openOverlayPermissionSettings(context) },
                     onCheckForUpdates = viewModel::checkForUpdates,
                     onDownloadUpdate = viewModel::downloadUpdate,

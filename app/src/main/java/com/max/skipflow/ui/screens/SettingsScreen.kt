@@ -23,11 +23,14 @@ import androidx.compose.material.icons.automirrored.rounded.VolumeOff
 import androidx.compose.material.icons.rounded.AutoAwesome
 import androidx.compose.material.icons.rounded.BugReport
 import androidx.compose.material.icons.rounded.Call
+import androidx.compose.material.icons.rounded.CleaningServices
 import androidx.compose.material.icons.rounded.CloudDownload
 import androidx.compose.material.icons.rounded.NotificationsActive
 import androidx.compose.material.icons.rounded.Refresh
+import androidx.compose.material.icons.rounded.SwipeUp
 import androidx.compose.material.icons.rounded.SystemUpdate
 import androidx.compose.material.icons.rounded.Vibration
+import androidx.compose.material.icons.rounded.VisibilityOff
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
@@ -68,6 +71,9 @@ fun SettingsScreen(
     onPauseDuringCallsChanged: (Boolean) -> Unit,
     onBounceBackFromPlayStoreChanged: (Boolean) -> Unit,
     onLiveDebugOverlayChanged: (Boolean) -> Unit,
+    onAdCurtainChanged: (Boolean) -> Unit,
+    onAutoSwipeSocialAdsChanged: (Boolean) -> Unit,
+    onAnnoyanceKillerChanged: (Boolean) -> Unit,
     onRequestOverlayPermission: () -> Unit,
     onCheckForUpdates: () -> Unit,
     onDownloadUpdate: (GitHubReleaseInfo) -> Unit,
@@ -190,6 +196,36 @@ fun SettingsScreen(
                         )
                     }
                 }
+
+                HorizontalDivider(color = SkipFlowColors.NavyBorder.copy(alpha = 0.6f))
+
+                SettingsToggleRow(
+                    icon = Icons.Rounded.VisibilityOff,
+                    title = "الستار الداكن أثناء العدّ التنازلي (Ad Curtain)",
+                    subtitle = "تغطية شاشة الإعلان بغطاء أنيق وكتم صوته مؤقتاً حتى انتهاء العدّ التنازلي مع إمكانية الإغلاق باللمس",
+                    checked = uiState.settings.adCurtainEnabled,
+                    onCheckedChange = onAdCurtainChanged
+                )
+
+                HorizontalDivider(color = SkipFlowColors.NavyBorder.copy(alpha = 0.6f))
+
+                SettingsToggleRow(
+                    icon = Icons.Rounded.SwipeUp,
+                    title = "تخطي إعلانات Shorts و Reels تلقائياً",
+                    subtitle = "تمرير الفيديو المموّل للأعلى تلقائياً داخل YouTube Shorts و TikTok و Instagram/Facebook Reels",
+                    checked = uiState.settings.autoSwipeSocialAdsEnabled,
+                    onCheckedChange = onAutoSwipeSocialAdsChanged
+                )
+
+                HorizontalDivider(color = SkipFlowColors.NavyBorder.copy(alpha = 0.6f))
+
+                SettingsToggleRow(
+                    icon = Icons.Rounded.CleaningServices,
+                    title = "إغلاق نوافذ التقييم والكوكيز المزعجة",
+                    subtitle = "إغلاق رسائل (قيّم تطبيقنا) وإشعارات الموافقة على الكوكيز في المتصفحات تلقائياً",
+                    checked = uiState.settings.annoyanceKillerEnabled,
+                    onCheckedChange = onAnnoyanceKillerChanged
+                )
             }
         }
 
@@ -288,22 +324,22 @@ private fun EngineCapabilitiesCard() {
                     tint = SkipFlowColors.ElectricBlue
                 )
                 Text(
-                    text = "تقنيات الحماية المدمجة (المرحلة الأولى)",
+                    text = "تقنيات الحماية الذكية (الإصدار v2.0)",
                     style = MaterialTheme.typography.titleMedium
                 )
             }
             Text(
-                text = "• التعرف المزدوج عبر النصوص ومعرّفات View IDs (YouTube / AdMob / Unity Ads / AppLovin)",
+                text = "• التعرف الهجين الثلاثي: Accessibility + OpenCV (0.68/0.78) + Tesseract OCR أوفلاين (عربي/إنجليزي) بوضعَي الطولي والعرضي",
                 style = MaterialTheme.typography.bodyMedium,
                 fontSize = 12.sp
             )
             Text(
-                text = "• منطقة الأمان لمنع الضغطات الخاطئة + اللمسة البشرية (إزاحة 2–5 بكسل وتأخير 100–250 مللي ثانية)",
+                text = "• التعلم التلقائي لأزرار X الوهمية وحظرها 24 ساعة + الرجوع التلقائي من متجر Play واختيارات التطبيقات",
                 style = MaterialTheme.typography.bodyMedium,
                 fontSize = 12.sp
             )
             Text(
-                text = "• الإغلاق متعدد المراحل لإعلانات الألعاب + إغلاق نوافذ YouTube Premium المزعجة تلقائياً",
+                text = "• ستار الإعلان مع كتم الصوت + التمرير التلقائي لإعلانات Shorts/Reels + الغفوة الذكية وأيقونة الإعدادات السريعة",
                 style = MaterialTheme.typography.bodyMedium,
                 fontSize = 12.sp
             )

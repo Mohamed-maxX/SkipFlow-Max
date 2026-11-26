@@ -1,6 +1,9 @@
 package com.max.skipflow.engine
 
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -79,5 +82,36 @@ class PlayStoreRedirectGuardTest {
                 enteredClassName = "ResolverActivity"
             )
         )
+    }
+
+    @Test
+    fun `records and consumes Fake-X candidate metadata when redirect bounce-back triggers`() {
+        val guard = PlayStoreRedirectGuard()
+        val trapBounds = BoundsRect(960, 40, 1050, 130)
+        guard.recordGameOrAdSkipAttempt(
+            packageName = "com.example.game",
+            nowMs = 30_000L,
+            activityName = "com.bytedance.sdk.openadsdk.activity.TTRewardExpressVideoActivity",
+            bounds = trapBounds,
+            screenWidth = 1080,
+            screenHeight = 2400,
+            viewId = "com.example.game:id/fake_close_btn"
+        )
+
+        assertTrue(
+            guard.shouldBounceBack(
+                enteredPackage = AdDetectionRules.PLAY_STORE_PACKAGE,
+                bounceBackEnabled = true,
+                nowMs = 31_100L
+            )
+        )
+
+        val tappedInfo = guard.consumeRedirectedTapInfo()
+        assertNotNull(tappedInfo)
+        assertEquals("com.example.game", tappedInfo!!.packageName)
+        assertEquals("com.example.game:id/fake_close_btn", tappedInfo.viewId)
+        assertEquals(trapBounds.centerX / 1080f, tappedInfo.normCenterX, 0.001f)
+        assertEquals(trapBounds.centerY / 2400f, tappedInfo.normCenterY, 0.001f)
+        assertNull(guard.consumeRedirectedTapInfo())
     }
 }

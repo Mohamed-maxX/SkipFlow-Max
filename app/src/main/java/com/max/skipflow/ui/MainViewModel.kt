@@ -13,14 +13,17 @@ import com.max.skipflow.SkipFlowApplication
 import com.max.skipflow.data.DailyStats
 import com.max.skipflow.data.InstalledAppInfo
 import com.max.skipflow.data.SkipFlowSettings
+import com.max.skipflow.data.SkipLogEntry
 import com.max.skipflow.engine.CallStateMonitor
 import com.max.skipflow.engine.SkipFlowAccessibilityService
 import com.max.skipflow.health.HealthStatus
 import com.max.skipflow.updater.GitHubReleaseInfo
 import com.max.skipflow.updater.OtaUpdateState
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
@@ -36,6 +39,8 @@ data class MainUiState(
     val settings: SkipFlowSettings = SkipFlowSettings(),
     val stats: DailyStats = DailyStats(),
     val disabledPackages: Set<String> = emptySet(),
+    val snoozeRemainingMs: Long = 0L,
+    val skipLogs: List<SkipLogEntry> = emptyList(),
     val healthStatus: HealthStatus = HealthStatus(),
     val canDrawOverlays: Boolean = false,
     val isServiceConnected: Boolean = false,
@@ -82,6 +87,17 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val _isLoadingApps = MutableStateFlow(true)
     private val _searchQuery = MutableStateFlow("")
     private val _appFilterTab = MutableStateFlow(AppFilterTab.ALL)
+    private val _snoozeRemainingMs = MutableStateFlow(repository.getSnoozeRemainingMs())
+
+    private val coreDataState = combine(
+        repository.settings,
+        repository.stats,
+        repository.disabledPackages,
+        repository.skipLogs,
+        _snoozeRemainingMs
+    ) { settings, stats, disabledPkgs, logs, snoozeRemainingMs ->
+        CoreDataSlice(settings, stats, disabledPkgs, logs, snoozeRemainingMs)
+    }
 
     private val appListState = combine(
         _installedApps,
@@ -103,16 +119,16 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     val uiState: StateFlow<MainUiState> = combine(
-        repository.settings,
-        repository.stats,
-        repository.disabledPackages,
+        coreDataState,
         appListState,
         systemStatusState
-    ) { settings, stats, disabledPkgs, appsSlice, sysSlice ->
+    ) { coreSlice, appsSlice, sysSlice ->
         MainUiState(
-            settings = settings,
-            stats = stats,
-            disabledPackages = disabledPkgs,
+            settings = coreSlice.settings,
+            stats = coreSlice.stats,
+            disabledPackages = coreSlice.disabledPackages,
+            snoozeRemainingMs = coreSlice.snoozeRemainingMs,
+            skipLogs = coreSlice.skipLogs,
             healthStatus = sysSlice.health,
             canDrawOverlays = sysSlice.canDrawOverlays,
             isServiceConnected = sysSlice.connected,
@@ -132,10 +148,31 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     init {
         refreshSystemState()
         loadInstalledApps()
+        observeSnoozeCountdown()
+    }
+
+    private fun observeSnoozeCountdown() {
+        viewModelScope.launch {
+            repository.snoozeUntilEpochMs.collectLatest { untilMs ->
+                while (true) {
+                    val remaining = (untilMs - System.currentTimeMillis()).coerceAtLeast(0L)
+                    _snoozeRemainingMs.value = remaining
+                    if (remaining <= 0L) {
+                        if (untilMs > 0L) {
+                            repository.cancelSmartSnooze()
+                            SkipFlowAccessibilityService.notifyControlStateChanged(getApplication())
+                        }
+                        break
+                    }
+                    delay(1_000L)
+                }
+            }
+        }
     }
 
     fun refreshSystemState() {
         repository.refreshDateRolloverIfNeeded()
+        _snoozeRemainingMs.value = repository.getSnoozeRemainingMs()
         _healthStatus.value = healthCheckManager.checkHealth()
         _canDrawOverlays.value = Settings.canDrawOverlays(getApplication())
         _isCallInProgress.value = CallStateMonitor.isCallActive(audioManager)
@@ -154,7 +191,26 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun toggleMasterEngine() {
-        repository.setEngineEnabled(!repository.settings.value.engineEnabled)
+        if (repository.isSnoozed()) {
+            repository.cancelSmartSnooze()
+            repository.setEngineEnabled(true)
+        } else {
+            repository.setEngineEnabled(!repository.settings.value.engineEnabled)
+        }
+        SkipFlowAccessibilityService.notifyControlStateChanged(getApplication())
+    }
+
+    fun startSmartSnooze() {
+        repository.startSmartSnooze()
+        _snoozeRemainingMs.value = repository.getSnoozeRemainingMs()
+        SkipFlowAccessibilityService.notifyControlStateChanged(getApplication())
+    }
+
+    fun cancelSmartSnooze() {
+        repository.cancelSmartSnooze()
+        repository.setEngineEnabled(true)
+        _snoozeRemainingMs.value = 0L
+        SkipFlowAccessibilityService.notifyControlStateChanged(getApplication())
     }
 
     fun setAutoMuteYouTubeAds(enabled: Boolean) {
@@ -175,6 +231,22 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun setBounceBackFromPlayStore(enabled: Boolean) {
         repository.setBounceBackFromPlayStore(enabled)
+    }
+
+    fun setAdCurtainEnabled(enabled: Boolean) {
+        repository.setAdCurtainEnabled(enabled)
+    }
+
+    fun setAutoSwipeSocialAdsEnabled(enabled: Boolean) {
+        repository.setAutoSwipeSocialAdsEnabled(enabled)
+    }
+
+    fun setAnnoyanceKillerEnabled(enabled: Boolean) {
+        repository.setAnnoyanceKillerEnabled(enabled)
+    }
+
+    fun clearSkipLogs() {
+        repository.clearSkipLogs()
     }
 
     fun setLiveDebugOverlayEnabled(context: Context, enabled: Boolean) {
@@ -233,6 +305,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun openReleasePage(context: Context, url: String) {
         otaUpdater.openReleasePage(context, url)
     }
+
+    private data class CoreDataSlice(
+        val settings: SkipFlowSettings,
+        val stats: DailyStats,
+        val disabledPackages: Set<String>,
+        val skipLogs: List<SkipLogEntry>,
+        val snoozeRemainingMs: Long
+    )
 
     private data class AppListSlice(
         val apps: List<InstalledAppInfo>,

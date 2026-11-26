@@ -29,6 +29,7 @@ import android.view.accessibility.AccessibilityWindowInfo
 import android.widget.Toast
 import androidx.annotation.RequiresApi
 import com.max.skipflow.SkipFlowApplication
+import com.max.skipflow.data.SkipDetectionMethod
 import com.max.skipflow.data.SkipFlowRepository
 import com.max.skipflow.vision.DetectedIconShape
 import com.max.skipflow.vision.OpenCvAdIconDetector
@@ -58,9 +59,11 @@ class SkipFlowAccessibilityService : AccessibilityService() {
     private lateinit var audioManager: AudioManager
     private lateinit var powerManager: PowerManager
     private lateinit var volumeController: YouTubeVolumeController
+    private lateinit var adCurtainVolumeController: YouTubeVolumeController
     private lateinit var openCvAdIconDetector: OpenCvAdIconDetector
     private lateinit var tesseractOcrEngine: TesseractOcrEngine
     private lateinit var debugOverlayManager: DebugOverlayManager
+    private lateinit var adCurtainOverlayManager: AdCurtainOverlayManager
 
     private val mainHandler = Handler(Looper.getMainLooper())
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
@@ -73,29 +76,36 @@ class SkipFlowAccessibilityService : AccessibilityService() {
 
     private var pollingJob: Job? = null
     private var settingsObserverJob: Job? = null
+    private var snoozeTickerJob: Job? = null
     private var activeMonitoredPackage: String? = null
     private var currentActivityPackage: String? = null
     private var currentActivityClassName: String? = null
     @Volatile
     private var isAdScreenActive: Boolean = false
+    private var adCurtainSuppressedSessionKey: String? = null
     private var lastScanElapsedMs: Long = 0L
     private var lastVisionScanStartedMs: Long = 0L
+    private var lastSocialSwipeAtMs: Long = 0L
+    private var lastAnnoyanceActionAtMs: Long = 0L
+    private var lastPassiveExcludeScanAtMs: Long = 0L
     private var lastToastShownAtMs: Long = 0L
     private var lastScreenshotStatus: String = "-"
     private var lastDebugDetail: String = "جاهز"
     private var pendingVolumeRestoreRunnable: Runnable? = null
     private var isScreenReceiverRegistered: Boolean = false
+    private val appNameCache = mutableMapOf<String, String>()
 
     private val screenStateReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             when (intent?.action) {
                 Intent.ACTION_SCREEN_OFF -> {
                     stopCountdownPolling()
+                    dismissAdCurtainAndRestoreAudio(clearSessionSuppression = true)
                     debugOverlayManager.hide()
                 }
                 Intent.ACTION_SCREEN_ON, Intent.ACTION_USER_PRESENT -> {
                     val pkg = activeMonitoredPackage
-                    if (pkg != null && repository.settings.value.engineEnabled) {
+                    if (pkg != null && isEngineActiveAndNotSnoozed()) {
                         ensureCountdownPollingActive()
                     }
                 }
@@ -110,15 +120,41 @@ class SkipFlowAccessibilityService : AccessibilityService() {
         openCvAdIconDetector = container.openCvAdIconDetector
         tesseractOcrEngine = container.tesseractOcrEngine
         debugOverlayManager = DebugOverlayManager(this)
+        adCurtainOverlayManager = AdCurtainOverlayManager(this)
         audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
         powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
         volumeController = YouTubeVolumeController(AndroidMediaVolumeBackend(audioManager))
+        adCurtainVolumeController = YouTubeVolumeController(AndroidMediaVolumeBackend(audioManager))
         registerScreenStateReceiver()
 
         settingsObserverJob = serviceScope.launch {
-            repository.settings.collect { settings ->
-                if (!settings.liveDebugOverlayEnabled || !settings.engineEnabled) {
-                    debugOverlayManager.hide()
+            launch {
+                repository.settings.collect { settings ->
+                    if (!settings.liveDebugOverlayEnabled || !settings.engineEnabled || repository.isSnoozed()) {
+                        debugOverlayManager.hide()
+                    }
+                    if (!settings.adCurtainEnabled || !settings.engineEnabled || repository.isSnoozed()) {
+                        dismissAdCurtainAndRestoreAudio(clearSessionSuppression = true)
+                    }
+                    if (!settings.engineEnabled || repository.isSnoozed()) {
+                        volumeController.forceRestore()
+                    }
+                    ServiceNotificationManager.syncNotification(this@SkipFlowAccessibilityService, isRunning)
+                    SkipFlowTileService.requestTileRefresh(this@SkipFlowAccessibilityService)
+                }
+            }
+            launch {
+                repository.snoozeUntilEpochMs.collect { snoozeUntilMs ->
+                    if (snoozeUntilMs > System.currentTimeMillis()) {
+                        dismissAdCurtainAndRestoreAudio(clearSessionSuppression = true)
+                        volumeController.forceRestore()
+                        debugOverlayManager.hide()
+                        startSnoozeCountdownTicker()
+                    } else {
+                        stopSnoozeCountdownTicker()
+                    }
+                    ServiceNotificationManager.syncNotification(this@SkipFlowAccessibilityService, isRunning)
+                    SkipFlowTileService.requestTileRefresh(this@SkipFlowAccessibilityService)
                 }
             }
         }
@@ -126,7 +162,13 @@ class SkipFlowAccessibilityService : AccessibilityService() {
 
     override fun onServiceConnected() {
         super.onServiceConnected()
+        activeInstance = this
         _isServiceConnected.value = true
+        if (repository.isSnoozed()) {
+            startSnoozeCountdownTicker()
+        }
+        ServiceNotificationManager.syncNotification(this, true)
+        SkipFlowTileService.requestTileRefresh(this)
     }
 
     override fun onConfigurationChanged(newConfig: Configuration) {
@@ -136,10 +178,12 @@ class SkipFlowAccessibilityService : AccessibilityService() {
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         val currentSettings = repository.settings.value
-        if (!currentSettings.engineEnabled) {
+        val snoozed = repository.isSnoozed()
+        if (!currentSettings.engineEnabled || snoozed) {
             stopCountdownPolling()
             activeMonitoredPackage = null
             _currentActivePackage.value = null
+            dismissAdCurtainAndRestoreAudio(clearSessionSuppression = true)
             volumeController.forceRestore()
             debugOverlayManager.hide()
             return
@@ -150,9 +194,10 @@ class SkipFlowAccessibilityService : AccessibilityService() {
         val isWindowChange = event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED
         val isTransientOverlay = AdDetectionRules.isTransientOverlayPackage(eventPkg, packageName)
 
-        // Anti-Redirect Bounce-Back: return user once if an ad click or auto-redirect
-        // opens Play Store (`com.android.vending`) or Android's app chooser / store picker
-        // (`android` / `ResolverActivity` / `ChooserActivity` / `"متجر Play"` / `"GetApps"` / `"حدد متجر تطبيقات"`).
+        // Anti-Redirect Bounce-Back + Fake-X Learning:
+        // Return user once if an ad click or auto-redirect opens Play Store (`com.android.vending`)
+        // or Android's app chooser / store picker (`android` / `ResolverActivity` / `ChooserActivity`),
+        // and remember the redirected corner button as a Fake-X Trap for 24 hours.
         if (!isTransientOverlay) {
             val isChooserOrWindow = isWindowChange ||
                 AdDetectionRules.isAppChooserPackageOrActivity(eventPkg, event.className)
@@ -166,18 +211,29 @@ class SkipFlowAccessibilityService : AccessibilityService() {
                         hasStoreChooserContent = chooserDialogDetected
                     )
                 ) {
+                    val redirectedTap = playStoreRedirectGuard.consumeRedirectedTapInfo()
+                    if (redirectedTap != null) {
+                        repository.recordFakeXTrap(
+                            packageName = redirectedTap.packageName,
+                            activityName = redirectedTap.activityName,
+                            normCenterX = redirectedTap.normCenterX,
+                            normCenterY = redirectedTap.normCenterY,
+                            viewId = redirectedTap.viewId
+                        )
+                    }
                     stopCountdownPolling()
                     activeMonitoredPackage = null
                     _currentActivePackage.value = null
+                    dismissAdCurtainAndRestoreAudio(clearSessionSuppression = true)
                     performGlobalAction(GLOBAL_ACTION_BACK)
                     emitStatusUpdate(
                         pkg = eventPkg,
                         isAdScreen = false,
                         screenshotStatus = "-",
-                        detail = if (eventPkg == AdDetectionRules.PLAY_STORE_PACKAGE) {
-                            "رجوع تلقائي من المتجر"
-                        } else {
-                            "إغلاق نافذة اختيار المتجر"
+                        detail = when {
+                            redirectedTap != null -> "حظر زر X وهمي (24 ساعة) والرجوع"
+                            eventPkg == AdDetectionRules.PLAY_STORE_PACKAGE -> "رجوع تلقائي من المتجر"
+                            else -> "إغلاق نافذة اختيار المتجر"
                         }
                     )
                     return
@@ -212,15 +268,41 @@ class SkipFlowAccessibilityService : AccessibilityService() {
             clearStaleAdState(newPackage = foregroundPkg)
         }
 
-        // Strict Exclusion List: never scan or click inside Play Store, GMS, Chrome, Social apps, System, Launchers, or SkipFlow Max
+        // Strict Exclusion List: never run ad-corner clicking or OpenCV inside Play Store, GMS, Chrome, Social apps, System, Launchers, or SkipFlow Max.
+        // Exception for Phase 2 safe Accessibility-only helpers (no OpenCV/corners):
+        // - Social Feed Auto-Swipe (Instagram Reels / Facebook Reels)
+        // - Annoyance Killer (Browser Cookie Banners)
         if (foregroundPkg == packageName || AdDetectionRules.isStrictlyExcludedPackage(foregroundPkg)) {
             clearStaleAdState(newPackage = null)
             activeMonitoredPackage = null
             _currentActivePackage.value = null
             stopCountdownPolling()
+            dismissAdCurtainAndRestoreAudio(clearSessionSuppression = true)
             if (foregroundPkg != AdDetectionRules.YOUTUBE_PACKAGE) {
                 volumeController.forceRestore()
             }
+
+            if (foregroundPkg != packageName &&
+                foregroundPkg !in repository.disabledPackages.value &&
+                !(currentSettings.pauseDuringCalls && CallStateMonitor.isCallActive(audioManager))
+            ) {
+                val eligibleForSocial = currentSettings.autoSwipeSocialAdsEnabled &&
+                    SocialAutoSwipeDetector.isSupportedSocialPackage(foregroundPkg)
+                val eligibleForCookies = currentSettings.annoyanceKillerEnabled &&
+                    AnnoyanceKillerDetector.isBrowserPackage(foregroundPkg)
+                if ((eligibleForSocial || eligibleForCookies) &&
+                    nowElapsed - lastPassiveExcludeScanAtMs >= CONTENT_SCAN_THROTTLE_MS
+                ) {
+                    lastPassiveExcludeScanAtMs = nowElapsed
+                    scanExcludedAppAccessibilityOnly(
+                        foregroundPkg = foregroundPkg,
+                        allowSocialAutoSwipe = eligibleForSocial,
+                        allowAnnoyanceKiller = eligibleForCookies,
+                        nowElapsed = nowElapsed
+                    )
+                }
+            }
+
             pushDebugOverlay(
                 pkg = foregroundPkg,
                 isAdScreen = false,
@@ -279,27 +361,38 @@ class SkipFlowAccessibilityService : AccessibilityService() {
 
     override fun onInterrupt() {
         stopCountdownPolling()
+        stopSnoozeCountdownTicker()
         cancelPendingVolumeRestore()
+        dismissAdCurtainAndRestoreAudio(clearSessionSuppression = true)
         volumeController.forceRestore()
         debugOverlayManager.hide()
         _isServiceConnected.value = false
+        ServiceNotificationManager.syncNotification(this, false)
+        SkipFlowTileService.requestTileRefresh(this)
     }
 
     override fun onUnbind(intent: Intent?): Boolean {
         stopCountdownPolling()
+        stopSnoozeCountdownTicker()
         cancelPendingVolumeRestore()
+        dismissAdCurtainAndRestoreAudio(clearSessionSuppression = true)
         volumeController.forceRestore()
         debugOverlayManager.hide()
+        if (activeInstance === this) activeInstance = null
         _isServiceConnected.value = false
         activeMonitoredPackage = null
         _currentActivePackage.value = null
+        ServiceNotificationManager.syncNotification(this, false)
+        SkipFlowTileService.requestTileRefresh(this)
         return super.onUnbind(intent)
     }
 
     override fun onDestroy() {
         stopCountdownPolling()
+        stopSnoozeCountdownTicker()
         settingsObserverJob?.cancel()
         cancelPendingVolumeRestore()
+        dismissAdCurtainAndRestoreAudio(clearSessionSuppression = true)
         volumeController.forceRestore()
         debugOverlayManager.hide()
         unregisterScreenStateReceiver()
@@ -307,14 +400,18 @@ class SkipFlowAccessibilityService : AccessibilityService() {
         tesseractOcrEngine.release()
         visionExecutor.shutdownNow()
         serviceScope.cancel()
+        if (activeInstance === this) activeInstance = null
         _isServiceConnected.value = false
         activeMonitoredPackage = null
         _currentActivePackage.value = null
+        ServiceNotificationManager.syncNotification(this, false)
+        SkipFlowTileService.requestTileRefresh(this)
         super.onDestroy()
     }
 
     private fun clearStaleAdState(newPackage: String? = currentActivityPackage) {
         isAdScreenActive = false
+        dismissAdCurtainAndRestoreAudio(clearSessionSuppression = true)
         if (newPackage != currentActivityPackage) {
             currentActivityPackage = newPackage
             currentActivityClassName = null
@@ -395,7 +492,7 @@ class SkipFlowAccessibilityService : AccessibilityService() {
             while (isActive) {
                 delay(COUNTDOWN_POLLING_INTERVAL_MS)
                 val settings = repository.settings.value
-                if (!settings.engineEnabled || !powerManager.isInteractive) {
+                if (!settings.engineEnabled || repository.isSnoozed() || !powerManager.isInteractive) {
                     clearStaleAdState(newPackage = null)
                     stopCountdownPolling()
                     break
@@ -533,8 +630,11 @@ class SkipFlowAccessibilityService : AccessibilityService() {
         var hasExplicitAdTreeText = false
         var hasUnityPlayerSurface = false
         var hasRealWebView = false
+        var hasCountdownTreeNode = false
+        var hasSponsoredSocialFeed = false
         var totalVisitedNodes = 0
         var bestCandidate: CandidateMatch? = null
+        var annoyanceMatch: AnnoyanceMatch? = null
         val excludedCornerRects = mutableListOf<BoundsRect>()
         var realAdActivityActive = isCurrentActivityRealAdScreen(monitoredPackage)
         val preferTopLeftCorner = realAdActivityActive &&
@@ -554,7 +654,12 @@ class SkipFlowAccessibilityService : AccessibilityService() {
                     root = root,
                     monitoredPackage = rootPkg,
                     isRealAdActivity = realAdActivityActive || isCurrentActivityRealAdScreen(rootPkg),
-                    preferTopLeftCorner = preferTopLeftCorner
+                    preferTopLeftCorner = preferTopLeftCorner,
+                    collectSocialSignals = currentSettings.autoSwipeSocialAdsEnabled &&
+                        SocialAutoSwipeDetector.isSupportedSocialPackage(rootPkg),
+                    collectAnnoyanceObservations = currentSettings.annoyanceKillerEnabled &&
+                        !realAdActivityActive &&
+                        rootPkg != AdDetectionRules.YOUTUBE_PACKAGE
                 )
                 totalVisitedNodes += result.visitedNodes
                 if (result.hasExplicitAdTextOrId) {
@@ -569,6 +674,15 @@ class SkipFlowAccessibilityService : AccessibilityService() {
                 if (result.hasYouTubeAdIndicator) {
                     hasYouTubeAd = true
                 }
+                if (result.hasCountdownIndicator) {
+                    hasCountdownTreeNode = true
+                }
+                if (result.isSponsoredSocialFeedVisible) {
+                    hasSponsoredSocialFeed = true
+                }
+                if (annoyanceMatch == null && result.annoyanceMatch != null) {
+                    annoyanceMatch = result.annoyanceMatch
+                }
                 excludedCornerRects.addAll(result.excludedRects)
                 val match = result.bestCandidate
                 if (match != null) {
@@ -582,6 +696,15 @@ class SkipFlowAccessibilityService : AccessibilityService() {
                     }
                 }
             }
+
+            excludedCornerRects.addAll(
+                repository.getFakeXTrapExclusionRects(
+                    packageName = monitoredPackage,
+                    activityName = currentActivityClassName,
+                    screenWidth = screenW,
+                    screenHeight = screenH
+                )
+            )
 
             // If we returned to UnityPlayer normal gameplay without any ad text in tree, clear stale AdActivity state immediately
             if (realAdActivityActive && hasUnityPlayerSurface && !hasExplicitAdTreeText) {
@@ -634,7 +757,20 @@ class SkipFlowAccessibilityService : AccessibilityService() {
                 )
 
                 if (decision is StageDecision.ExecuteTap) {
-                    playStoreRedirectGuard.recordGameOrAdSkipAttempt(monitoredPackage, nowElapsed)
+                    dismissAdCurtainAndRestoreAudio(suppressForCurrentSession = true)
+                    if (!isYouTubeAction) {
+                        playStoreRedirectGuard.recordGameOrAdSkipAttempt(
+                            packageName = monitoredPackage,
+                            nowMs = nowElapsed,
+                            activityName = currentActivityClassName,
+                            bounds = explicitWinner.bounds,
+                            screenWidth = screenW,
+                            screenHeight = screenH,
+                            viewId = explicitWinner.viewId
+                        )
+                    } else {
+                        playStoreRedirectGuard.recordGameOrAdSkipAttempt(monitoredPackage, nowElapsed)
+                    }
                     pushDebugOverlay(
                         pkg = monitoredPackage,
                         isAdScreen = true,
@@ -642,11 +778,17 @@ class SkipFlowAccessibilityService : AccessibilityService() {
                         detail = "A11y: ${explicitWinner.targetType.name}"
                     )
                     executeTargetAction(
+                        packageName = monitoredPackage,
                         candidate = explicitWinner,
                         stageNumber = decision.stageNumber,
-                        countAsNewAdSkip = decision.countAsNewAdSkip
+                        countAsNewAdSkip = decision.countAsNewAdSkip,
+                        detectionMethod = SkipDetectionMethod.ACCESSIBILITY,
+                        detectionDetail = explicitWinner.targetType.name
                     )
                 } else if (decision is StageDecision.Ignore) {
+                    if (realAdActivityActive && currentSettings.adCurtainEnabled && hasCountdownTreeNode) {
+                        showAdCurtainAndMuteIfAllowed(monitoredPackage)
+                    }
                     pushDebugOverlay(
                         pkg = monitoredPackage,
                         isAdScreen = true,
@@ -657,9 +799,46 @@ class SkipFlowAccessibilityService : AccessibilityService() {
                 return
             }
 
+            // Social Feed Auto-Swipe (YouTube Shorts & TikTok sponsored items when no regular YouTube skip button applies)
+            if (currentSettings.autoSwipeSocialAdsEnabled &&
+                hasSponsoredSocialFeed &&
+                !confirmedAdByTreeOrActivity &&
+                nowElapsed - lastSocialSwipeAtMs >= SocialAutoSwipeDetector.SWIPE_COOLDOWN_MS
+            ) {
+                performSocialAutoSwipe(monitoredPackage, screenW, screenH, nowElapsed)
+                return
+            }
+
+            // Annoyance Killer (Rate Us dialogs in normal non-ad screens)
+            val chosenAnnoyance = annoyanceMatch
+            if (currentSettings.annoyanceKillerEnabled &&
+                chosenAnnoyance != null &&
+                !confirmedAdByTreeOrActivity &&
+                nowElapsed - lastAnnoyanceActionAtMs >= AnnoyanceKillerDetector.ANNOYANCE_COOLDOWN_MS
+            ) {
+                performAnnoyanceDismiss(monitoredPackage, chosenAnnoyance, nowElapsed)
+                return
+            }
+
+            // Ad Curtain Overlay during active countdown before skip/close button appears on confirmed full-screen Ad Activity
+            val sessionKey = buildAdCurtainSessionKey(monitoredPackage)
+            if (realAdActivityActive &&
+                currentSettings.adCurtainEnabled &&
+                (hasCountdownTreeNode || adCurtainSuppressedSessionKey != sessionKey)
+            ) {
+                showAdCurtainAndMuteIfAllowed(monitoredPackage)
+            } else if (!realAdActivityActive) {
+                dismissAdCurtainAndRestoreAudio(clearSessionSuppression = true)
+            }
+
+            // Do not run OpenCV/OCR fallback while browsing a normal TikTok/social feed without real AdActivity
+            val isNormalSocialFeedBrowse = SocialAutoSwipeDetector.isSupportedSocialPackage(monitoredPackage) &&
+                !confirmedAdByTreeOrActivity
+
             // Strict Gate: Only run OpenCV directly on Confirmed AdActivity or explicit A11y ad text;
             // on unconfirmed WebView/sparse containers (never on UnityPlayer gameplay), allow OCR text check only.
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R &&
+            if (!isNormalSocialFeedBrowse &&
+                Build.VERSION.SDK_INT >= Build.VERSION_CODES.R &&
                 shouldAttemptVisionFallback(
                     monitoredPackage = monitoredPackage,
                     isRealAdActivity = realAdActivityActive,
@@ -743,75 +922,86 @@ class SkipFlowAccessibilityService : AccessibilityService() {
         if (!isVisionScanInFlight.compareAndSet(false, true)) return
         lastVisionScanStartedMs = SystemClock.elapsedRealtime()
 
-        runCatching {
-            takeScreenshot(
-                Display.DEFAULT_DISPLAY,
-                visionExecutor,
-                object : TakeScreenshotCallback {
-                    override fun onSuccess(screenshot: ScreenshotResult) {
-                        val hardwareBuffer = screenshot.hardwareBuffer
-                        var hardwareBitmap: Bitmap? = null
-                        var softwareBitmap: Bitmap? = null
-                        try {
-                            // Android 16 / wide-gamut HardwareBuffer -> immediate ARGB_8888 Software Bitmap copy
-                            hardwareBitmap = runCatching {
-                                Bitmap.wrapHardwareBuffer(hardwareBuffer, screenshot.colorSpace)
-                            }.getOrNull() ?: Bitmap.wrapHardwareBuffer(hardwareBuffer, null)
+        adCurtainOverlayManager.hideTemporarilyForCapture {
+            if (!isStillValidForVisionTap(monitoredPackage, scanGeneration)) {
+                adCurtainOverlayManager.restoreAfterCapture()
+                isVisionScanInFlight.set(false)
+                return@hideTemporarilyForCapture
+            }
 
-                            softwareBitmap = hardwareBitmap?.copy(Bitmap.Config.ARGB_8888, false)
-                        } catch (_: Throwable) {
-                            softwareBitmap = null
-                        } finally {
-                            hardwareBitmap?.recycle()
-                            runCatching { hardwareBuffer.close() }
+            runCatching {
+                takeScreenshot(
+                    Display.DEFAULT_DISPLAY,
+                    visionExecutor,
+                    object : TakeScreenshotCallback {
+                        override fun onSuccess(screenshot: ScreenshotResult) {
+                            adCurtainOverlayManager.restoreAfterCapture()
+                            val hardwareBuffer = screenshot.hardwareBuffer
+                            var hardwareBitmap: Bitmap? = null
+                            var softwareBitmap: Bitmap? = null
+                            try {
+                                // Android 16 / wide-gamut HardwareBuffer -> immediate ARGB_8888 Software Bitmap copy
+                                hardwareBitmap = runCatching {
+                                    Bitmap.wrapHardwareBuffer(hardwareBuffer, screenshot.colorSpace)
+                                }.getOrNull() ?: Bitmap.wrapHardwareBuffer(hardwareBuffer, null)
+
+                                softwareBitmap = hardwareBitmap?.copy(Bitmap.Config.ARGB_8888, false)
+                            } catch (_: Throwable) {
+                                softwareBitmap = null
+                            } finally {
+                                hardwareBitmap?.recycle()
+                                runCatching { hardwareBuffer.close() }
+                            }
+
+                            if (softwareBitmap == null) {
+                                lastScreenshotStatus = "Fail(copy)"
+                                pushDebugOverlay(
+                                    pkg = monitoredPackage,
+                                    isAdScreen = isRealAdActivity || hasExplicitAdTreeText,
+                                    screenshotStatus = lastScreenshotStatus,
+                                    detail = "فشل نسخ HardwareBitmap"
+                                )
+                                isVisionScanInFlight.set(false)
+                                return
+                            }
+
+                            lastScreenshotStatus = "OK"
+                            serviceScope.launch(Dispatchers.Default) {
+                                try {
+                                    analyzeSoftwareScreenshot(
+                                        softwareBitmap = softwareBitmap,
+                                        expectedPackage = monitoredPackage,
+                                        isRealAdActivity = isRealAdActivity,
+                                        hasExplicitAdTreeText = hasExplicitAdTreeText,
+                                        preferTopLeftCorner = preferTopLeftCorner,
+                                        scanGeneration = scanGeneration,
+                                        excludedRects = excludedRects
+                                    )
+                                } finally {
+                                    softwareBitmap.recycle()
+                                    isVisionScanInFlight.set(false)
+                                }
+                            }
                         }
 
-                        if (softwareBitmap == null) {
-                            lastScreenshotStatus = "Fail(copy)"
+                        override fun onFailure(errorCode: Int) {
+                            adCurtainOverlayManager.restoreAfterCapture()
+                            lastScreenshotStatus = "Fail($errorCode)"
                             pushDebugOverlay(
                                 pkg = monitoredPackage,
                                 isAdScreen = isRealAdActivity || hasExplicitAdTreeText,
                                 screenshotStatus = lastScreenshotStatus,
-                                detail = "فشل نسخ HardwareBitmap"
+                                detail = if (errorCode == 6) "شاشة محمية SECURE" else "خطأ لقطة ($errorCode)"
                             )
                             isVisionScanInFlight.set(false)
-                            return
-                        }
-
-                        lastScreenshotStatus = "OK"
-                        serviceScope.launch(Dispatchers.Default) {
-                            try {
-                                analyzeSoftwareScreenshot(
-                                    softwareBitmap = softwareBitmap,
-                                    expectedPackage = monitoredPackage,
-                                    isRealAdActivity = isRealAdActivity,
-                                    hasExplicitAdTreeText = hasExplicitAdTreeText,
-                                    preferTopLeftCorner = preferTopLeftCorner,
-                                    scanGeneration = scanGeneration,
-                                    excludedRects = excludedRects
-                                )
-                            } finally {
-                                softwareBitmap.recycle()
-                                isVisionScanInFlight.set(false)
-                            }
                         }
                     }
-
-                    override fun onFailure(errorCode: Int) {
-                        lastScreenshotStatus = "Fail($errorCode)"
-                        pushDebugOverlay(
-                            pkg = monitoredPackage,
-                            isAdScreen = isRealAdActivity || hasExplicitAdTreeText,
-                            screenshotStatus = lastScreenshotStatus,
-                            detail = if (errorCode == 6) "شاشة محمية SECURE" else "خطأ لقطة ($errorCode)"
-                        )
-                        isVisionScanInFlight.set(false)
-                    }
-                }
-            )
-        }.onFailure {
-            lastScreenshotStatus = "Fail(ex)"
-            isVisionScanInFlight.set(false)
+                )
+            }.onFailure {
+                adCurtainOverlayManager.restoreAfterCapture()
+                lastScreenshotStatus = "Fail(ex)"
+                isVisionScanInFlight.set(false)
+            }
         }
     }
 
@@ -830,11 +1020,17 @@ class SkipFlowAccessibilityService : AccessibilityService() {
         val confirmedBeforeOcr = isRealAdActivity || hasExplicitAdTreeText
         var targetBounds: BoundsRect? = null
         var targetType: AdTargetType = AdTargetType.GAME_AD_ICON
+        var detectedMethod: SkipDetectionMethod = SkipDetectionMethod.OPENCV
         var detectedDetail = "ليست شاشة إعلان"
         var detectedAsAd = confirmedBeforeOcr
         var ocvMaxScore = 0.0
 
-        var effectiveExcludedRects = excludedRects
+        var effectiveExcludedRects = excludedRects + repository.getFakeXTrapExclusionRects(
+            packageName = expectedPackage,
+            activityName = currentActivityClassName,
+            screenWidth = screenW,
+            screenHeight = screenH
+        )
 
         // 1. Strict Gate: ONLY run OpenCV & Corner OCR upfront when screen is
         //    either a confirmed AdActivity (`>= 0.68`) OR actively displaying explicit ad text (`>= 0.78`).
@@ -879,6 +1075,7 @@ class SkipFlowAccessibilityService : AccessibilityService() {
             if (ocvSummary.detection != null) {
                 targetBounds = ocvSummary.detection.boundsOnScreen
                 targetType = AdTargetType.GAME_AD_ICON
+                detectedMethod = SkipDetectionMethod.OPENCV
                 detectedDetail = String.format(
                     Locale.US,
                     "OCV %s (%.2f)",
@@ -900,6 +1097,7 @@ class SkipFlowAccessibilityService : AccessibilityService() {
                 if (cornerOcr.actionTargetBounds != null) {
                     targetBounds = cornerOcr.actionTargetBounds
                     targetType = AdTargetType.GAME_AD_SKIP
+                    detectedMethod = SkipDetectionMethod.OCR
                     detectedDetail = "CornerOCR: ${cornerOcr.matchedKeyword}"
                 }
             }
@@ -925,6 +1123,7 @@ class SkipFlowAccessibilityService : AccessibilityService() {
             if (ocrResult.hasAdContext && ocrResult.actionTargetBounds != null) {
                 targetBounds = ocrResult.actionTargetBounds
                 targetType = AdTargetType.GAME_AD_SKIP
+                detectedMethod = SkipDetectionMethod.OCR
                 detectedDetail = "OCR: ${ocrResult.matchedKeyword}"
             } else if (ocrResult.hasAdContext && !confirmedBeforeOcr) {
                 // Ad confirmed via visible OCR text -> now safe to run OpenCV (`>= 0.78`) & Corner OCR
@@ -940,6 +1139,7 @@ class SkipFlowAccessibilityService : AccessibilityService() {
                 if (ocvSummary.detection != null) {
                     targetBounds = ocvSummary.detection.boundsOnScreen
                     targetType = AdTargetType.GAME_AD_ICON
+                    detectedMethod = SkipDetectionMethod.OPENCV
                     detectedDetail = String.format(
                         Locale.US,
                         "OCV %s (%.2f)",
@@ -956,6 +1156,7 @@ class SkipFlowAccessibilityService : AccessibilityService() {
                     if (cornerOcr.actionTargetBounds != null) {
                         targetBounds = cornerOcr.actionTargetBounds
                         targetType = AdTargetType.GAME_AD_SKIP
+                        detectedMethod = SkipDetectionMethod.OCR
                         detectedDetail = "CornerOCR: ${cornerOcr.matchedKeyword}"
                     } else {
                         detectedDetail = String.format(Locale.US, "OCV=%.2f | بلا زر", ocvMaxScore)
@@ -1010,7 +1211,16 @@ class SkipFlowAccessibilityService : AccessibilityService() {
                 nowMs = nowMs
             )
             if (decision is StageDecision.ExecuteTap) {
-                playStoreRedirectGuard.recordGameOrAdSkipAttempt(expectedPackage, nowMs)
+                dismissAdCurtainAndRestoreAudio(suppressForCurrentSession = true)
+                playStoreRedirectGuard.recordGameOrAdSkipAttempt(
+                    packageName = expectedPackage,
+                    nowMs = nowMs,
+                    activityName = currentActivityClassName,
+                    bounds = resolvedBounds,
+                    screenWidth = screenW,
+                    screenHeight = screenH,
+                    viewId = null
+                )
                 pushDebugOverlay(
                     pkg = expectedPackage,
                     isAdScreen = true,
@@ -1018,10 +1228,13 @@ class SkipFlowAccessibilityService : AccessibilityService() {
                     detail = "$detectedDetail -> ضغط"
                 )
                 dispatchCenterGesture(
+                    packageName = expectedPackage,
                     bounds = resolvedBounds,
                     targetType = targetType,
                     stageNumber = decision.stageNumber,
-                    countAsNewAdSkip = decision.countAsNewAdSkip
+                    countAsNewAdSkip = decision.countAsNewAdSkip,
+                    detectionMethod = detectedMethod,
+                    detectionDetail = detectedDetail
                 )
             } else if (decision is StageDecision.Ignore) {
                 pushDebugOverlay(
@@ -1037,7 +1250,7 @@ class SkipFlowAccessibilityService : AccessibilityService() {
     private fun isStillValidForVisionTap(expectedPackage: String, scanGeneration: Long): Boolean {
         if (visionGenerationId.get() != scanGeneration) return false
         val settings = repository.settings.value
-        if (!settings.engineEnabled) return false
+        if (!settings.engineEnabled || repository.isSnoozed()) return false
         if (!powerManager.isInteractive) return false
         if (settings.pauseDuringCalls && CallStateMonitor.isCallActive(audioManager)) return false
         if (AdDetectionRules.isStrictlyExcludedPackage(expectedPackage) ||
@@ -1122,6 +1335,7 @@ class SkipFlowAccessibilityService : AccessibilityService() {
         val targetType: AdTargetType,
         val bounds: BoundsRect,
         val priority: Int,
+        val viewId: String?,
         var nodeCopy: AccessibilityNodeInfo?
     ) {
         fun recycleNode(service: SkipFlowAccessibilityService) {
@@ -1132,6 +1346,7 @@ class SkipFlowAccessibilityService : AccessibilityService() {
 
     private data class CornerIconCandidate(
         val bounds: BoundsRect,
+        val viewId: String?,
         val hasPositiveHint: Boolean,
         val isClickable: Boolean,
         val nodeCopy: AccessibilityNodeInfo
@@ -1143,6 +1358,9 @@ class SkipFlowAccessibilityService : AccessibilityService() {
         val hasExplicitAdTextOrId: Boolean,
         val hasUnityPlayerSurface: Boolean,
         val hasRealWebView: Boolean,
+        val hasCountdownIndicator: Boolean,
+        val isSponsoredSocialFeedVisible: Boolean,
+        val annoyanceMatch: AnnoyanceMatch?,
         val visitedNodes: Int,
         val excludedRects: List<BoundsRect>
     )
@@ -1151,7 +1369,9 @@ class SkipFlowAccessibilityService : AccessibilityService() {
         root: AccessibilityNodeInfo,
         monitoredPackage: String,
         isRealAdActivity: Boolean,
-        preferTopLeftCorner: Boolean
+        preferTopLeftCorner: Boolean,
+        collectSocialSignals: Boolean = false,
+        collectAnnoyanceObservations: Boolean = false
     ): TreeScanResult {
         val (screenW, screenH, density) = getCurrentDisplayMetrics()
         val queue = ArrayDeque<Triple<AccessibilityNodeInfo, Int, Boolean>>()
@@ -1164,6 +1384,11 @@ class SkipFlowAccessibilityService : AccessibilityService() {
         var hasExplicitAdTextOrId = false
         var hasUnityPlayerSurface = rootClass?.contains("UnityPlayer", ignoreCase = true) == true
         var hasRealWebView = rootIsWebView
+        var hasCountdownIndicator = false
+        var hasSponsoredSocialLabel = false
+        val socialViewIds = if (collectSocialSignals) mutableListOf<String>() else null
+        val socialTexts = if (collectSocialSignals) mutableListOf<String>() else null
+        val annoyanceObservations = if (collectAnnoyanceObservations) mutableListOf<AnnoyanceNodeObservation>() else null
         var explicitBestCandidate: CandidateMatch? = null
         var contextGatedBestCandidate: CandidateMatch? = null
         val cornerIconCandidates = mutableListOf<CornerIconCandidate>()
@@ -1204,6 +1429,43 @@ class SkipFlowAccessibilityService : AccessibilityService() {
                         hasExplicitAdTextOrId = true
                     }
 
+                    if (isRealAdActivity && !hasCountdownIndicator) {
+                        val normT = AdDetectionRules.normalizeText(text)
+                        val normD = AdDetectionRules.normalizeText(desc)
+                        if ((normT != null && AdDetectionRules.isCountdownText(normT)) ||
+                            (normD != null && AdDetectionRules.isCountdownText(normD))
+                        ) {
+                            hasCountdownIndicator = true
+                        }
+                    }
+
+                    if (collectSocialSignals) {
+                        if (!viewId.isNullOrBlank() && socialViewIds != null && socialViewIds.size < 160) {
+                            socialViewIds.add(viewId)
+                        }
+                        if (socialTexts != null && socialTexts.size < 160) {
+                            text?.toString()?.takeIf { it.isNotBlank() }?.let { socialTexts.add(it) }
+                            desc?.toString()?.takeIf { it.isNotBlank() }?.let { socialTexts.add(it) }
+                        }
+                        if (!hasSponsoredSocialLabel && SocialAutoSwipeDetector.isSponsoredFeedLabel(viewId, text, desc)) {
+                            hasSponsoredSocialLabel = true
+                        }
+                    }
+
+                    if (collectAnnoyanceObservations && annoyanceObservations != null && annoyanceObservations.size < 180) {
+                        node.getBoundsInScreen(tempRect)
+                        val obsBounds = BoundsRect(tempRect.left, tempRect.top, tempRect.right, tempRect.bottom)
+                        annoyanceObservations.add(
+                            AnnoyanceNodeObservation(
+                                index = annoyanceObservations.size,
+                                text = text?.toString(),
+                                contentDescription = desc?.toString(),
+                                bounds = obsBounds,
+                                isClickable = node.isClickable || isAncestorClickable(node)
+                            )
+                        )
+                    }
+
                     if (!isYouTube && AdDetectionRules.hasExcludedCornerKeyword(viewId, text, desc)) {
                         node.getBoundsInScreen(tempRect)
                         val exRect = BoundsRect(tempRect.left, tempRect.top, tempRect.right, tempRect.bottom)
@@ -1242,23 +1504,34 @@ class SkipFlowAccessibilityService : AccessibilityService() {
                     if (explicitTarget != null) {
                         val hasStorePillHierarchy = !isYouTube && hasStoreRedirectInHierarchy(node)
                         val isCountdownContainer = hasCountdownDescendant(node)
-                        if (!hasStorePillHierarchy && !isCountdownContainer) {
-                            val targetBounds = resolveEffectiveBounds(node, screenW, screenH, tempRect)
-                            if (SafeZoneEvaluator.isWithinSafeZone(targetBounds, screenW, screenH, explicitTarget)) {
-                                val nextMatch = CandidateMatch(
-                                    targetType = explicitTarget,
-                                    bounds = targetBounds,
-                                    priority = priorityFor(explicitTarget),
-                                    nodeCopy = obtainNodeCopy(node)
-                                )
-                                if (explicitBestCandidate == null ||
-                                    isHigherPriorityMatch(nextMatch, explicitBestCandidate, preferTopLeftCorner, screenW, screenH)
-                                ) {
-                                    explicitBestCandidate?.recycleNode(this)
-                                    explicitBestCandidate = nextMatch
-                                } else {
-                                    nextMatch.recycleNode(this)
-                                }
+                        val targetBounds = resolveEffectiveBounds(node, screenW, screenH, tempRect)
+                        val isKnownFakeTrap = !isYouTube && repository.isKnownFakeXTrap(
+                            packageName = monitoredPackage,
+                            activityName = currentActivityClassName,
+                            bounds = targetBounds,
+                            screenWidth = screenW,
+                            screenHeight = screenH,
+                            viewId = viewId
+                        )
+                        if (!hasStorePillHierarchy &&
+                            !isCountdownContainer &&
+                            !isKnownFakeTrap &&
+                            SafeZoneEvaluator.isWithinSafeZone(targetBounds, screenW, screenH, explicitTarget)
+                        ) {
+                            val nextMatch = CandidateMatch(
+                                targetType = explicitTarget,
+                                bounds = targetBounds,
+                                priority = priorityFor(explicitTarget),
+                                viewId = viewId,
+                                nodeCopy = obtainNodeCopy(node)
+                            )
+                            if (explicitBestCandidate == null ||
+                                isHigherPriorityMatch(nextMatch, explicitBestCandidate, preferTopLeftCorner, screenW, screenH)
+                            ) {
+                                explicitBestCandidate?.recycleNode(this)
+                                explicitBestCandidate = nextMatch
+                            } else {
+                                nextMatch.recycleNode(this)
                             }
                         }
                     } else if (!isYouTube) {
@@ -1273,23 +1546,34 @@ class SkipFlowAccessibilityService : AccessibilityService() {
                         if (contextualTarget != null) {
                             val hasStorePillHierarchy = hasStoreRedirectInHierarchy(node)
                             val isCountdownContainer = hasCountdownDescendant(node)
-                            if (!hasStorePillHierarchy && !isCountdownContainer) {
-                                val targetBounds = resolveEffectiveBounds(node, screenW, screenH, tempRect)
-                                if (SafeZoneEvaluator.isWithinSafeZone(targetBounds, screenW, screenH, contextualTarget)) {
-                                    val nextMatch = CandidateMatch(
-                                        targetType = contextualTarget,
-                                        bounds = targetBounds,
-                                        priority = priorityFor(contextualTarget),
-                                        nodeCopy = obtainNodeCopy(node)
-                                    )
-                                    if (contextGatedBestCandidate == null ||
-                                        isHigherPriorityMatch(nextMatch, contextGatedBestCandidate, preferTopLeftCorner, screenW, screenH)
-                                    ) {
-                                        contextGatedBestCandidate?.recycleNode(this)
-                                        contextGatedBestCandidate = nextMatch
-                                    } else {
-                                        nextMatch.recycleNode(this)
-                                    }
+                            val targetBounds = resolveEffectiveBounds(node, screenW, screenH, tempRect)
+                            val isKnownFakeTrap = repository.isKnownFakeXTrap(
+                                packageName = monitoredPackage,
+                                activityName = currentActivityClassName,
+                                bounds = targetBounds,
+                                screenWidth = screenW,
+                                screenHeight = screenH,
+                                viewId = viewId
+                            )
+                            if (!hasStorePillHierarchy &&
+                                !isCountdownContainer &&
+                                !isKnownFakeTrap &&
+                                SafeZoneEvaluator.isWithinSafeZone(targetBounds, screenW, screenH, contextualTarget)
+                            ) {
+                                val nextMatch = CandidateMatch(
+                                    targetType = contextualTarget,
+                                    bounds = targetBounds,
+                                    priority = priorityFor(contextualTarget),
+                                    viewId = viewId,
+                                    nodeCopy = obtainNodeCopy(node)
+                                )
+                                if (contextGatedBestCandidate == null ||
+                                    isHigherPriorityMatch(nextMatch, contextGatedBestCandidate, preferTopLeftCorner, screenW, screenH)
+                                ) {
+                                    contextGatedBestCandidate?.recycleNode(this)
+                                    contextGatedBestCandidate = nextMatch
+                                } else {
+                                    nextMatch.recycleNode(this)
                                 }
                             }
                         } else if (isCornerIconCandidateClass(node, isWebViewNode) &&
@@ -1297,7 +1581,16 @@ class SkipFlowAccessibilityService : AccessibilityService() {
                         ) {
                             node.getBoundsInScreen(tempRect)
                             val iconBounds = BoundsRect(tempRect.left, tempRect.top, tempRect.right, tempRect.bottom)
-                            if (SafeZoneEvaluator.isCornerAdIconSize(iconBounds, screenW, screenH, density) &&
+                            val isKnownFakeTrap = repository.isKnownFakeXTrap(
+                                packageName = monitoredPackage,
+                                activityName = currentActivityClassName,
+                                bounds = iconBounds,
+                                screenWidth = screenW,
+                                screenHeight = screenH,
+                                viewId = viewId
+                            )
+                            if (!isKnownFakeTrap &&
+                                SafeZoneEvaluator.isCornerAdIconSize(iconBounds, screenW, screenH, density) &&
                                 !AdDetectionRules.isExcludedCornerIcon(viewId, text, desc) &&
                                 !hasStoreRedirectInHierarchy(node) &&
                                 !hasCountdownDescendant(node)
@@ -1305,6 +1598,7 @@ class SkipFlowAccessibilityService : AccessibilityService() {
                                 cornerIconCandidates.add(
                                     CornerIconCandidate(
                                         bounds = iconBounds,
+                                        viewId = viewId,
                                         hasPositiveHint = true,
                                         isClickable = clickableSelfOrParent,
                                         nodeCopy = obtainNodeCopy(node)
@@ -1357,11 +1651,31 @@ class SkipFlowAccessibilityService : AccessibilityService() {
                 targetType = AdTargetType.GAME_AD_ICON,
                 bounds = chosen.bounds,
                 priority = priorityFor(AdTargetType.GAME_AD_ICON),
+                viewId = chosen.viewId,
                 nodeCopy = obtainNodeCopy(chosen.nodeCopy)
             )
         }
 
         cornerIconCandidates.forEach { safeRecycle(it.nodeCopy) }
+
+        val isSponsoredSocialVisible = collectSocialSignals &&
+            hasSponsoredSocialLabel &&
+            SocialAutoSwipeDetector.isFeedSurfaceConfirmed(
+                packageName = monitoredPackage,
+                viewIdResourceNames = socialViewIds.orEmpty(),
+                visibleTexts = socialTexts.orEmpty()
+            )
+
+        val resolvedAnnoyanceMatch = if (collectAnnoyanceObservations && !isRealAdActivity && !hasExplicitAdTextOrId) {
+            AnnoyanceKillerDetector.evaluateTree(
+                packageName = monitoredPackage,
+                observations = annoyanceObservations.orEmpty(),
+                screenWidth = screenW,
+                screenHeight = screenH
+            )
+        } else {
+            null
+        }
 
         return TreeScanResult(
             bestCandidate = chosenCandidate,
@@ -1369,6 +1683,9 @@ class SkipFlowAccessibilityService : AccessibilityService() {
             hasExplicitAdTextOrId = hasExplicitAdTextOrId,
             hasUnityPlayerSurface = hasUnityPlayerSurface,
             hasRealWebView = hasRealWebView,
+            hasCountdownIndicator = hasCountdownIndicator,
+            isSponsoredSocialFeedVisible = isSponsoredSocialVisible,
+            annoyanceMatch = resolvedAnnoyanceMatch,
             visitedNodes = visitedNodes,
             excludedRects = excludedRects
         )
@@ -1608,9 +1925,12 @@ class SkipFlowAccessibilityService : AccessibilityService() {
     }
 
     private fun executeTargetAction(
+        packageName: String,
         candidate: CandidateMatch,
         stageNumber: Int,
-        countAsNewAdSkip: Boolean
+        countAsNewAdSkip: Boolean,
+        detectionMethod: SkipDetectionMethod,
+        detectionDetail: String
     ) {
         if (candidate.targetType == AdTargetType.YOUTUBE_SKIP_AD ||
             candidate.targetType == AdTargetType.YOUTUBE_POPUP_DISMISS
@@ -1618,19 +1938,25 @@ class SkipFlowAccessibilityService : AccessibilityService() {
             val clickedViaAccessibility = tryClickSelfOrClickableAncestor(candidate.nodeCopy)
             if (clickedViaAccessibility) {
                 onSkipGestureSucceeded(
+                    packageName = packageName,
                     targetType = candidate.targetType,
                     stageNumber = stageNumber,
-                    countAsNewAdSkip = countAsNewAdSkip
+                    countAsNewAdSkip = countAsNewAdSkip,
+                    detectionMethod = detectionMethod,
+                    detectionDetail = detectionDetail
                 )
                 return
             }
         }
 
         dispatchCenterGesture(
+            packageName = packageName,
             bounds = candidate.bounds,
             targetType = candidate.targetType,
             stageNumber = stageNumber,
-            countAsNewAdSkip = countAsNewAdSkip
+            countAsNewAdSkip = countAsNewAdSkip,
+            detectionMethod = detectionMethod,
+            detectionDetail = detectionDetail
         )
     }
 
@@ -1659,10 +1985,13 @@ class SkipFlowAccessibilityService : AccessibilityService() {
     }
 
     private fun dispatchCenterGesture(
+        packageName: String,
         bounds: BoundsRect,
         targetType: AdTargetType,
         stageNumber: Int,
-        countAsNewAdSkip: Boolean
+        countAsNewAdSkip: Boolean,
+        detectionMethod: SkipDetectionMethod,
+        detectionDetail: String
     ) {
         val (currentW, currentH, _) = getCurrentDisplayMetrics()
         val (tapX, tapY) = DisplayGeometry.clampTapPoint(
@@ -1684,9 +2013,12 @@ class SkipFlowAccessibilityService : AccessibilityService() {
             object : GestureResultCallback() {
                 override fun onCompleted(gestureDescription: GestureDescription?) {
                     onSkipGestureSucceeded(
+                        packageName = packageName,
                         targetType = targetType,
                         stageNumber = stageNumber,
-                        countAsNewAdSkip = countAsNewAdSkip
+                        countAsNewAdSkip = countAsNewAdSkip,
+                        detectionMethod = detectionMethod,
+                        detectionDetail = detectionDetail
                     )
                 }
             },
@@ -1695,9 +2027,12 @@ class SkipFlowAccessibilityService : AccessibilityService() {
     }
 
     private fun onSkipGestureSucceeded(
+        packageName: String,
         targetType: AdTargetType,
         stageNumber: Int,
-        countAsNewAdSkip: Boolean
+        countAsNewAdSkip: Boolean,
+        detectionMethod: SkipDetectionMethod,
+        detectionDetail: String
     ) {
         if (targetType == AdTargetType.YOUTUBE_SKIP_AD) {
             cancelPendingVolumeRestore()
@@ -1707,6 +2042,14 @@ class SkipFlowAccessibilityService : AccessibilityService() {
         if (countAsNewAdSkip) {
             repository.recordAdSkipped(targetType.estimatedSavedSeconds)
         }
+        repository.recordSkipLog(
+            packageName = packageName,
+            appName = resolveAppName(packageName),
+            method = detectionMethod,
+            detail = detectionDetail
+        )
+        ServiceNotificationManager.syncNotification(this, isRunning)
+        SkipFlowTileService.requestTileRefresh(this)
 
         val settings = repository.settings.value
         if (settings.vibrateOnSkip) {
@@ -1849,6 +2192,261 @@ class SkipFlowAccessibilityService : AccessibilityService() {
         return Triple(resolvedW, resolvedH, density)
     }
 
+    private fun scanExcludedAppAccessibilityOnly(
+        foregroundPkg: String,
+        allowSocialAutoSwipe: Boolean,
+        allowAnnoyanceKiller: Boolean,
+        nowElapsed: Long
+    ) {
+        val roots = mutableListOf<AccessibilityNodeInfo>()
+        runCatching {
+            for (window in windows) {
+                if (window.type != AccessibilityWindowInfo.TYPE_APPLICATION) continue
+                val winRoot = window.root ?: continue
+                if (winRoot.packageName?.toString() == foregroundPkg && roots.none { it == winRoot }) {
+                    roots.add(winRoot)
+                } else {
+                    safeRecycle(winRoot)
+                }
+            }
+        }
+        if (roots.isEmpty()) {
+            rootInActiveWindow?.let { activeRoot ->
+                if (activeRoot.packageName?.toString() == foregroundPkg) {
+                    roots.add(activeRoot)
+                } else {
+                    safeRecycle(activeRoot)
+                }
+            }
+        }
+        if (roots.isEmpty()) return
+
+        val (screenW, screenH, _) = getCurrentDisplayMetrics()
+        var sponsoredFeedDetected = false
+        var detectedAnnoyance: AnnoyanceMatch? = null
+
+        try {
+            for (root in roots) {
+                val result = scanWindowTree(
+                    root = root,
+                    monitoredPackage = foregroundPkg,
+                    isRealAdActivity = false,
+                    preferTopLeftCorner = false,
+                    collectSocialSignals = allowSocialAutoSwipe,
+                    collectAnnoyanceObservations = allowAnnoyanceKiller
+                )
+                result.bestCandidate?.recycleNode(this)
+                if (result.isSponsoredSocialFeedVisible) {
+                    sponsoredFeedDetected = true
+                }
+                if (detectedAnnoyance == null && result.annoyanceMatch != null) {
+                    detectedAnnoyance = result.annoyanceMatch
+                }
+            }
+
+            if (allowSocialAutoSwipe &&
+                sponsoredFeedDetected &&
+                nowElapsed - lastSocialSwipeAtMs >= SocialAutoSwipeDetector.SWIPE_COOLDOWN_MS
+            ) {
+                performSocialAutoSwipe(foregroundPkg, screenW, screenH, nowElapsed)
+                return
+            }
+
+            val annoyance = detectedAnnoyance
+            if (allowAnnoyanceKiller &&
+                annoyance != null &&
+                nowElapsed - lastAnnoyanceActionAtMs >= AnnoyanceKillerDetector.ANNOYANCE_COOLDOWN_MS
+            ) {
+                performAnnoyanceDismiss(foregroundPkg, annoyance, nowElapsed)
+            }
+        } finally {
+            roots.forEach { safeRecycle(it) }
+        }
+    }
+
+    private fun performSocialAutoSwipe(
+        pkg: String,
+        screenW: Int,
+        screenH: Int,
+        nowElapsed: Long
+    ) {
+        val plan = SocialAutoSwipeDetector.buildSwipePlan(
+            screenWidth = screenW,
+            screenHeight = screenH,
+            jitterX = ((nowElapsed % 21L) - 10L).toFloat()
+        )
+
+        lastSocialSwipeAtMs = nowElapsed
+        val path = Path().apply {
+            moveTo(plan.startX, plan.startY)
+            lineTo(plan.endX, plan.endY)
+        }
+        val gesture = GestureDescription.Builder()
+            .addStroke(GestureDescription.StrokeDescription(path, 0L, plan.durationMs))
+            .build()
+
+        dispatchGesture(
+            gesture,
+            object : GestureResultCallback() {
+                override fun onCompleted(gestureDescription: GestureDescription?) {
+                    repository.recordAdSkipped(AdTargetType.YOUTUBE_SKIP_AD.estimatedSavedSeconds)
+                    repository.recordSkipLog(
+                        packageName = pkg,
+                        appName = resolveAppName(pkg),
+                        method = SkipDetectionMethod.AUTO_SWIPE,
+                        detail = "تمرير إعلان Reels/Shorts تلقائياً"
+                    )
+                    if (repository.settings.value.vibrateOnSkip) {
+                        performSubtleVibration()
+                    }
+                    if (repository.settings.value.toastOnSkip) {
+                        showDebouncedToast("تم تخطي إعلان Shorts/Reels تلقائياً", SystemClock.elapsedRealtime())
+                    }
+                    ServiceNotificationManager.syncNotification(this@SkipFlowAccessibilityService, isRunning)
+                    SkipFlowTileService.requestTileRefresh(this@SkipFlowAccessibilityService)
+                }
+            },
+            mainHandler
+        )
+    }
+
+    private fun performAnnoyanceDismiss(
+        pkg: String,
+        match: AnnoyanceMatch,
+        nowElapsed: Long
+    ) {
+        lastAnnoyanceActionAtMs = nowElapsed
+        val (currentW, currentH, _) = getCurrentDisplayMetrics()
+        val (tapX, tapY) = DisplayGeometry.clampTapPoint(
+            x = match.bounds.centerX.toFloat(),
+            y = match.bounds.centerY.toFloat(),
+            screenWidth = currentW,
+            screenHeight = currentH
+        )
+        val path = Path().apply { moveTo(tapX, tapY) }
+        val gesture = GestureDescription.Builder()
+            .addStroke(GestureDescription.StrokeDescription(path, 0L, 55L))
+            .build()
+
+        dispatchGesture(
+            gesture,
+            object : GestureResultCallback() {
+                override fun onCompleted(gestureDescription: GestureDescription?) {
+                    val label = if (match.kind == "RateUs") {
+                        "إغلاق نافذة التقييم"
+                    } else {
+                        "إغلاق إشعار الكوكيز"
+                    }
+                    repository.recordSkipLog(
+                        packageName = pkg,
+                        appName = resolveAppName(pkg),
+                        method = SkipDetectionMethod.ANNOYANCE_KILLER,
+                        detail = label
+                    )
+                    if (repository.settings.value.vibrateOnSkip) {
+                        performSubtleVibration()
+                    }
+                }
+            },
+            mainHandler
+        )
+    }
+
+    private fun buildAdCurtainSessionKey(pkg: String): String {
+        return "$pkg|${currentActivityClassName.orEmpty()}"
+    }
+
+    private fun showAdCurtainAndMuteIfAllowed(pkg: String) {
+        val sessionKey = buildAdCurtainSessionKey(pkg)
+        adCurtainOverlayManager.resetSessionDismissalIfChanged(sessionKey)
+        if (adCurtainOverlayManager.isDismissedForSession(sessionKey) ||
+            adCurtainSuppressedSessionKey == sessionKey
+        ) {
+            return
+        }
+        adCurtainVolumeController.onAdVisible(autoMuteEnabled = true)
+        adCurtainOverlayManager.show(sessionKey) {
+            adCurtainSuppressedSessionKey = sessionKey
+            adCurtainVolumeController.forceRestore()
+        }
+    }
+
+    private fun dismissAdCurtainAndRestoreAudio(
+        clearSessionSuppression: Boolean = false,
+        suppressForCurrentSession: Boolean = false
+    ) {
+        if (suppressForCurrentSession) {
+            val pkg = currentActivityPackage ?: activeMonitoredPackage
+            if (!pkg.isNullOrBlank()) {
+                adCurtainSuppressedSessionKey = buildAdCurtainSessionKey(pkg)
+            }
+        }
+        if (clearSessionSuppression) {
+            adCurtainSuppressedSessionKey = null
+        }
+        adCurtainOverlayManager.dismiss(clearSessionDismissal = clearSessionSuppression)
+        adCurtainVolumeController.forceRestore()
+    }
+
+    private fun startSnoozeCountdownTicker() {
+        if (snoozeTickerJob?.isActive == true) return
+        snoozeTickerJob = serviceScope.launch {
+            while (isActive) {
+                val remainingMs = repository.getSnoozeRemainingMs()
+                ServiceNotificationManager.syncNotification(this@SkipFlowAccessibilityService, isRunning)
+                SkipFlowTileService.requestTileRefresh(this@SkipFlowAccessibilityService)
+                if (remainingMs <= 0L) {
+                    repository.cancelSmartSnooze()
+                    ServiceNotificationManager.syncNotification(this@SkipFlowAccessibilityService, isRunning)
+                    SkipFlowTileService.requestTileRefresh(this@SkipFlowAccessibilityService)
+                    break
+                }
+                delay(1_000L)
+            }
+            snoozeTickerJob = null
+        }
+    }
+
+    private fun stopSnoozeCountdownTicker() {
+        snoozeTickerJob?.cancel()
+        snoozeTickerJob = null
+    }
+
+    private fun onExternalControlStateChanged() {
+        val settings = repository.settings.value
+        val snoozed = repository.isSnoozed()
+        if (!settings.engineEnabled || snoozed) {
+            stopCountdownPolling()
+            dismissAdCurtainAndRestoreAudio(clearSessionSuppression = true)
+            volumeController.forceRestore()
+            debugOverlayManager.hide()
+            if (snoozed) {
+                startSnoozeCountdownTicker()
+            }
+        } else {
+            stopSnoozeCountdownTicker()
+        }
+        ServiceNotificationManager.syncNotification(this, isRunning)
+        SkipFlowTileService.requestTileRefresh(this)
+    }
+
+    private fun isEngineActiveAndNotSnoozed(): Boolean {
+        return repository.settings.value.engineEnabled && !repository.isSnoozed()
+    }
+
+    private fun resolveAppName(pkg: String): String {
+        appNameCache[pkg]?.let { return it }
+        val label = runCatching {
+            val info = packageManager.getApplicationInfo(pkg, 0)
+            packageManager.getApplicationLabel(info)?.toString()?.trim()
+        }.getOrNull()?.takeIf { it.isNotBlank() } ?: pkg
+        if (appNameCache.size > 120) {
+            appNameCache.clear()
+        }
+        appNameCache[pkg] = label
+        return label
+    }
+
     private fun cancelPendingVolumeRestore() {
         pendingVolumeRestoreRunnable?.let { mainHandler.removeCallbacks(it) }
         pendingVolumeRestoreRunnable = null
@@ -1908,7 +2506,19 @@ class SkipFlowAccessibilityService : AccessibilityService() {
         private val _isServiceConnected = MutableStateFlow(false)
         val isServiceConnected: StateFlow<Boolean> = _isServiceConnected.asStateFlow()
 
+        val isRunning: Boolean
+            get() = _isServiceConnected.value
+
+        @Volatile
+        private var activeInstance: SkipFlowAccessibilityService? = null
+
         private val _currentActivePackage = MutableStateFlow<String?>(null)
         val currentActivePackage: StateFlow<String?> = _currentActivePackage.asStateFlow()
+
+        fun notifyControlStateChanged(context: Context) {
+            ServiceNotificationManager.syncNotification(context.applicationContext, isRunning)
+            SkipFlowTileService.requestTileRefresh(context.applicationContext)
+            activeInstance?.onExternalControlStateChanged()
+        }
     }
 }
