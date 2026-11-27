@@ -47,4 +47,15 @@ class DisplayGeometryTest {
         assertEquals(2399f, tapX, 0.001f)
         assertEquals(1079f, tapY, 0.001f)
     }
+
+    @Test
+    fun `AdCurtain leaves top 16pct Portrait and 22pct Landscape corners uncovered`() {
+        val portraitTopOffset = AdCurtainLayoutPolicy.topExclusionOffsetPx(1080, 2400)
+        assertEquals((2400 * 0.16f).toInt(), portraitTopOffset)
+
+        val landscapeTopOffset = AdCurtainLayoutPolicy.topExclusionOffsetPx(2400, 1080)
+        assertEquals((1080 * 0.22f).toInt(), landscapeTopOffset)
+
+        assertEquals(50L, AdCurtainLayoutPolicy.HIDE_SETTLE_DELAY_MS)
+    }
 }

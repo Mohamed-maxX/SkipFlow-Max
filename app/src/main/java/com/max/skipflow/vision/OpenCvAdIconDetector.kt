@@ -41,7 +41,7 @@ object OpenCvTemplateEvaluator {
 
     const val MATCH_THRESHOLD = 0.78
     const val CONFIRMED_AD_MATCH_THRESHOLD = 0.68
-    val SCALES = floatArrayOf(0.7f, 1.0f, 1.3f)
+    val SCALES = floatArrayOf(0.7f, 0.85f, 1.0f, 1.3f)
 
     fun thresholdForContext(isConfirmedAdActivity: Boolean): Double {
         return if (isConfirmedAdActivity) CONFIRMED_AD_MATCH_THRESHOLD else MATCH_THRESHOLD
@@ -205,11 +205,33 @@ class OpenCvAdIconDetector {
         val roiMat = Mat(fullMat, cropRect)
         val cropGray = Mat()
         val cropInv = Mat()
+        val cropBlur = Mat()
+        val cropAdaptive = Mat()
+        val cropEdges = Mat()
+        val cropEdgesSmooth = Mat()
         var bestCornerScore = 0.0
 
         try {
             Imgproc.cvtColor(roiMat, cropGray, Imgproc.COLOR_RGBA2GRAY)
             Core.bitwise_not(cropGray, cropInv)
+            Imgproc.GaussianBlur(cropGray, cropBlur, Size(3.0, 3.0), 0.8)
+
+            // Adaptive threshold extracts crisp white `>>` / `X` glyphs even over translucent video backgrounds
+            val adaptiveBlock = (((baseSizePx * 0.6f).toInt() or 1).coerceIn(11, 31))
+            Imgproc.adaptiveThreshold(
+                cropBlur,
+                cropAdaptive,
+                255.0,
+                Imgproc.ADAPTIVE_THRESH_GAUSSIAN_C,
+                Imgproc.THRESH_BINARY,
+                adaptiveBlock,
+                -10.0
+            )
+
+            // Canny edges + light 3x3 smoothing removes background brightness/transparency drag
+            Imgproc.Canny(cropBlur, cropEdges, 45.0, 130.0)
+            Imgproc.GaussianBlur(cropEdges, cropEdgesSmooth, Size(3.0, 3.0), 0.9)
+            val hasEdgePixels = Core.countNonZero(cropEdges) >= 8
 
             for (spec in templates) {
                 val aspect = spec.mat.cols().toFloat() / spec.mat.rows().toFloat().coerceAtLeast(1f)
@@ -220,8 +242,13 @@ class OpenCvAdIconDetector {
                     if (targetW >= cropGray.cols() - 2 || targetH >= cropGray.rows() - 2) continue
 
                     val scaledTemplate = Mat()
+                    val scaledTemplateBinary = Mat()
+                    val scaledTemplateEdges = Mat()
+                    val scaledTemplateEdgesSmooth = Mat()
                     val resultNormal = Mat()
                     val resultInv = Mat()
+                    val resultAdaptive = Mat()
+                    val resultEdges = Mat()
                     try {
                         Imgproc.resize(
                             spec.mat,
@@ -232,7 +259,7 @@ class OpenCvAdIconDetector {
                             Imgproc.INTER_AREA
                         )
 
-                        // Check white-on-dark polarity
+                        // 1. White-on-dark polarity
                         Imgproc.matchTemplate(cropGray, scaledTemplate, resultNormal, Imgproc.TM_CCOEFF_NORMED)
                         val mmrNormal = Core.minMaxLoc(resultNormal)
                         bestCornerScore = maxOf(bestCornerScore, mmrNormal.maxVal)
@@ -251,7 +278,7 @@ class OpenCvAdIconDetector {
                             )
                         }
 
-                        // Check dark-on-light polarity (light-theme end-card close buttons)
+                        // 2. Dark-on-light polarity (light-theme end-card close buttons)
                         Imgproc.matchTemplate(cropInv, scaledTemplate, resultInv, Imgproc.TM_CCOEFF_NORMED)
                         val mmrInv = Core.minMaxLoc(resultInv)
                         bestCornerScore = maxOf(bestCornerScore, mmrInv.maxVal)
@@ -269,14 +296,70 @@ class OpenCvAdIconDetector {
                                 out = out
                             )
                         }
+
+                        // 3. Adaptive binary match (bright white glyph inside translucent dark pill)
+                        Imgproc.threshold(scaledTemplate, scaledTemplateBinary, 165.0, 255.0, Imgproc.THRESH_BINARY)
+                        if (Core.countNonZero(scaledTemplateBinary) >= 6) {
+                            Imgproc.matchTemplate(cropAdaptive, scaledTemplateBinary, resultAdaptive, Imgproc.TM_CCOEFF_NORMED)
+                            val mmrAdaptive = Core.minMaxLoc(resultAdaptive)
+                            bestCornerScore = maxOf(bestCornerScore, mmrAdaptive.maxVal)
+                            if (mmrAdaptive.maxVal >= threshold) {
+                                addDetectionIfNotExcluded(
+                                    loc = mmrAdaptive.maxLoc,
+                                    score = mmrAdaptive.maxVal,
+                                    targetW = targetW,
+                                    targetH = targetH,
+                                    cropRect = cropRect,
+                                    scaleToBmpX = scaleToBmpX,
+                                    scaleToBmpY = scaleToBmpY,
+                                    shape = spec.shape,
+                                    excludedRects = excludedRects,
+                                    out = out
+                                )
+                            }
+                        }
+
+                        // 4. Canny edge match (invariant to semi-transparent circle & video background brightness)
+                        if (hasEdgePixels) {
+                            Imgproc.Canny(scaledTemplate, scaledTemplateEdges, 45.0, 130.0)
+                            if (Core.countNonZero(scaledTemplateEdges) >= 6) {
+                                Imgproc.GaussianBlur(scaledTemplateEdges, scaledTemplateEdgesSmooth, Size(3.0, 3.0), 0.9)
+                                Imgproc.matchTemplate(cropEdgesSmooth, scaledTemplateEdgesSmooth, resultEdges, Imgproc.TM_CCOEFF_NORMED)
+                                val mmrEdges = Core.minMaxLoc(resultEdges)
+                                bestCornerScore = maxOf(bestCornerScore, mmrEdges.maxVal)
+                                if (mmrEdges.maxVal >= threshold) {
+                                    addDetectionIfNotExcluded(
+                                        loc = mmrEdges.maxLoc,
+                                        score = mmrEdges.maxVal,
+                                        targetW = targetW,
+                                        targetH = targetH,
+                                        cropRect = cropRect,
+                                        scaleToBmpX = scaleToBmpX,
+                                        scaleToBmpY = scaleToBmpY,
+                                        shape = spec.shape,
+                                        excludedRects = excludedRects,
+                                        out = out
+                                    )
+                                }
+                            }
+                        }
                     } finally {
+                        resultEdges.release()
+                        resultAdaptive.release()
                         resultInv.release()
                         resultNormal.release()
+                        scaledTemplateEdgesSmooth.release()
+                        scaledTemplateEdges.release()
+                        scaledTemplateBinary.release()
                         scaledTemplate.release()
                     }
                 }
             }
         } finally {
+            cropEdgesSmooth.release()
+            cropEdges.release()
+            cropAdaptive.release()
+            cropBlur.release()
             cropInv.release()
             cropGray.release()
             roiMat.release()
@@ -326,6 +409,7 @@ class OpenCvAdIconDetector {
             TemplateSpec(DetectedIconShape.CROSS_X, createPlainXTemplate()),
             TemplateSpec(DetectedIconShape.CROSS_X, createThinPlainXTemplate()),
             TemplateSpec(DetectedIconShape.DOUBLE_CHEVRON, createCircleDoubleChevronTemplate()),
+            TemplateSpec(DetectedIconShape.DOUBLE_CHEVRON, createTranslucentCircleSmallDoubleChevronTemplate()),
             TemplateSpec(DetectedIconShape.DOUBLE_CHEVRON, createRoundedRectDoubleChevronTemplate()),
             TemplateSpec(DetectedIconShape.DOUBLE_CHEVRON, createPlainDoubleChevronTemplate()),
             TemplateSpec(DetectedIconShape.DOUBLE_CHEVRON, createThinPlainDoubleChevronTemplate())
@@ -382,6 +466,23 @@ class OpenCvAdIconDetector {
         // Second '>'
         Imgproc.line(mat, Point(33.0, 21.0), Point(46.0, 32.0), Scalar(255.0), 4, Imgproc.LINE_AA, 0)
         Imgproc.line(mat, Point(46.0, 32.0), Point(33.0, 43.0), Scalar(255.0), 4, Imgproc.LINE_AA, 0)
+        return mat
+    }
+
+    /**
+     * Dedicated Pangle / TikTok top-left skip template: compact crisp white `>>` chevrons
+     * centered inside a dark semi-transparent circular pill with subtle outer ring stroke.
+     */
+    private fun createTranslucentCircleSmallDoubleChevronTemplate(): Mat {
+        val mat = Mat(64, 64, CvType.CV_8UC1, Scalar(115.0))
+        Imgproc.circle(mat, Point(32.0, 32.0), 26, Scalar(52.0), -1, Imgproc.LINE_AA, 0)
+        Imgproc.circle(mat, Point(32.0, 32.0), 26, Scalar(165.0), 1, Imgproc.LINE_AA, 0)
+        // First small '>'
+        Imgproc.line(mat, Point(20.0, 23.0), Point(30.0, 32.0), Scalar(255.0), 3, Imgproc.LINE_AA, 0)
+        Imgproc.line(mat, Point(30.0, 32.0), Point(20.0, 41.0), Scalar(255.0), 3, Imgproc.LINE_AA, 0)
+        // Second small '>'
+        Imgproc.line(mat, Point(33.0, 23.0), Point(43.0, 32.0), Scalar(255.0), 3, Imgproc.LINE_AA, 0)
+        Imgproc.line(mat, Point(43.0, 32.0), Point(33.0, 41.0), Scalar(255.0), 3, Imgproc.LINE_AA, 0)
         return mat
     }
 

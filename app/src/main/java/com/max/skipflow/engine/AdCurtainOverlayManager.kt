@@ -5,8 +5,11 @@ import android.graphics.Color
 import android.graphics.PixelFormat
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
+import android.util.DisplayMetrics
 import android.util.TypedValue
 import android.view.Gravity
 import android.view.View
@@ -17,10 +20,32 @@ import android.widget.LinearLayout
 import android.widget.TextView
 
 /**
+ * Pure JVM-testable geometry helper guaranteeing the Ad Curtain never covers top ad corners.
+ */
+object AdCurtainLayoutPolicy {
+    const val PORTRAIT_TOP_MARGIN_RATIO = 0.16f
+    const val LANDSCAPE_TOP_MARGIN_RATIO = 0.22f
+    const val HIDE_SETTLE_DELAY_MS = 50L
+
+    fun topExclusionOffsetPx(screenWidth: Int, screenHeight: Int): Int {
+        if (screenHeight <= 0) return 0
+        val ratio = if (screenWidth > screenHeight) {
+            LANDSCAPE_TOP_MARGIN_RATIO
+        } else {
+            PORTRAIT_TOP_MARGIN_RATIO
+        }
+        return (screenHeight * ratio).toInt().coerceAtLeast(0)
+    }
+}
+
+/**
  * Displays a sleek Obsidian-Black & Electric-Blue semi-transparent curtain overlay
- * (`TYPE_ACCESSIBILITY_OVERLAY`) during confirmed full-screen Ad Activity countdowns.
- * Includes a tap-to-dismiss failsafe so the user is never trapped, plus brief hide/restore hooks
- * when OpenCV/Tesseract needs to capture a clean screenshot of the underlying ad.
+ * (`TYPE_ACCESSIBILITY_OVERLAY`) during confirmed full-screen Ad Activity countdowns:
+ * 1. Positioned below the top corner strip (top 16% Portrait / 22% Landscape) so top-corner
+ *    `>>` / `X` / `Skip` controls remain 100% unobstructed.
+ * 2. The dark backdrop window uses `FLAG_NOT_TOUCHABLE` so automated/user taps never get swallowed;
+ *    only the compact centered card's `"إغلاق الستار"` pill accepts dismiss taps.
+ * 3. Supports synchronous `View.INVISIBLE` + 50ms frame-clear hooks before `takeScreenshot()` or `dispatchGesture()`.
  */
 class AdCurtainOverlayManager(
     private val serviceContext: Context
@@ -29,7 +54,10 @@ class AdCurtainOverlayManager(
     private val mainHandler = Handler(Looper.getMainLooper())
 
     @Volatile
-    private var curtainView: FrameLayout? = null
+    private var veilView: FrameLayout? = null
+
+    @Volatile
+    private var controlCardView: LinearLayout? = null
 
     @Volatile
     private var activeSessionKey: String? = null
@@ -40,8 +68,11 @@ class AdCurtainOverlayManager(
     @Volatile
     private var activeFlag: Boolean = false
 
+    @Volatile
+    private var lastHideOrDismissElapsedMs: Long = 0L
+
     val isShowing: Boolean
-        get() = activeFlag && curtainView != null
+        get() = (activeFlag || veilView != null || controlCardView != null)
 
     fun isDismissedForSession(sessionKey: String): Boolean {
         return dismissedSessionKey != null && dismissedSessionKey == sessionKey
@@ -60,35 +91,54 @@ class AdCurtainOverlayManager(
         if (isDismissedForSession(sessionKey)) {
             return
         }
-        if (activeFlag && activeSessionKey == sessionKey && curtainView != null) {
+        if (activeFlag && activeSessionKey == sessionKey && veilView != null) {
             return
         }
 
         activeSessionKey = sessionKey
         activeFlag = true
 
-        mainHandler.post {
-            if (!activeFlag || isDismissedForSession(sessionKey)) return@post
-            val existing = curtainView
-            if (existing != null) {
-                existing.visibility = View.VISIBLE
-                return@post
+        runOnMain {
+            if (!activeFlag || isDismissedForSession(sessionKey)) return@runOnMain
+            val existingVeil = veilView
+            val existingCard = controlCardView
+            if (existingVeil != null && existingCard != null) {
+                existingVeil.visibility = View.VISIBLE
+                existingCard.visibility = View.VISIBLE
+                return@runOnMain
             }
 
+            dismissInternalOnMain()
+
+            val (screenW, screenH) = queryDisplaySizePx()
+            val topMarginPx = AdCurtainLayoutPolicy.topExclusionOffsetPx(screenW, screenH)
+            val veilHeightPx = (screenH - topMarginPx).coerceAtLeast(120)
             val density = serviceContext.resources.displayMetrics.density.coerceAtLeast(1f)
-            val root = FrameLayout(serviceContext).apply {
-                setBackgroundColor(Color.parseColor("#D905070A"))
-                isClickable = true
+
+            // 1. Non-touchable translucent veil starting BELOW the top 16%/22% ad corner region
+            val veil = FrameLayout(serviceContext).apply {
+                setBackgroundColor(Color.parseColor("#D405070A"))
+                isClickable = false
                 isFocusable = false
-                setOnClickListener {
-                    dismissedSessionKey = activeSessionKey
-                    dismissInternalOnMain()
-                    onUserDismissed()
-                }
+            }
+            val veilParams = WindowManager.LayoutParams(
+                WindowManager.LayoutParams.MATCH_PARENT,
+                veilHeightPx,
+                WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                    WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                    WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                    WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                PixelFormat.TRANSLUCENT
+            ).apply {
+                gravity = Gravity.TOP or Gravity.START
+                x = 0
+                y = topMarginPx
             }
 
-            val cardPadH = (24f * density).toInt()
-            val cardPadV = (20f * density).toInt()
+            // 2. Compact centered card whose ONLY interactive zone is the centered card / close pill
+            val cardPadH = (22f * density).toInt()
+            val cardPadV = (18f * density).toInt()
             val card = LinearLayout(serviceContext).apply {
                 orientation = LinearLayout.VERTICAL
                 gravity = Gravity.CENTER_HORIZONTAL
@@ -96,7 +146,7 @@ class AdCurtainOverlayManager(
                 background = GradientDrawable().apply {
                     shape = GradientDrawable.RECTANGLE
                     cornerRadius = 24f * density
-                    setColor(Color.parseColor("#F00D131F"))
+                    setColor(Color.parseColor("#F20D131F"))
                     setStroke(
                         (1.5f * density).toInt().coerceAtLeast(1),
                         Color.parseColor("#CC0088FF")
@@ -121,111 +171,175 @@ class AdCurtainOverlayManager(
             val title = TextView(serviceContext).apply {
                 text = "SkipFlow Max • جاري التخطي..."
                 setTextColor(Color.parseColor("#F4F7FC"))
-                setTextSize(TypedValue.COMPLEX_UNIT_SP, 17f)
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
                 setTypeface(Typeface.DEFAULT_BOLD)
                 textDirection = View.TEXT_DIRECTION_RTL
                 gravity = Gravity.CENTER
-                setPadding(0, (12f * density).toInt(), 0, (6f * density).toInt())
+                setPadding(0, (10f * density).toInt(), 0, (4f * density).toInt())
             }
 
             val subtitle = TextView(serviceContext).apply {
-                text = "تم حجب الإعلان وكتم صوته حتى انتهاء العدّ التنازلي"
+                text = "تم كتم الصوت وحجب وسط الشاشة مؤقتاً"
                 setTextColor(Color.parseColor("#9AA6BA"))
-                setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f)
                 textDirection = View.TEXT_DIRECTION_RTL
                 gravity = Gravity.CENTER
-                setPadding(0, 0, 0, (14f * density).toInt())
+                setPadding(0, 0, 0, (12f * density).toInt())
             }
 
-            val failsafeHint = TextView(serviceContext).apply {
-                text = "اضغط في أي مكان لإغلاق الستار فوراً"
-                setTextColor(Color.parseColor("#0088FF"))
-                setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            val closePill = TextView(serviceContext).apply {
+                text = "إغلاق الستار"
+                setTextColor(Color.WHITE)
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f)
                 setTypeface(Typeface.DEFAULT_BOLD)
                 textDirection = View.TEXT_DIRECTION_RTL
                 gravity = Gravity.CENTER
+                setPadding((18f * density).toInt(), (8f * density).toInt(), (18f * density).toInt(), (8f * density).toInt())
+                background = GradientDrawable().apply {
+                    shape = GradientDrawable.RECTANGLE
+                    cornerRadius = 99f * density
+                    setColor(Color.parseColor("#FF0088FF"))
+                }
+                isClickable = true
+                setOnClickListener {
+                    dismissedSessionKey = activeSessionKey
+                    activeFlag = false
+                    dismissInternalOnMain()
+                    onUserDismissed()
+                }
             }
 
             card.addView(badge)
             card.addView(title)
             card.addView(subtitle)
-            card.addView(failsafeHint)
+            card.addView(closePill)
 
-            val cardParams = FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.WRAP_CONTENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT,
-                Gravity.CENTER
-            ).apply {
-                val margin = (24f * density).toInt()
-                setMargins(margin, margin, margin, margin)
-            }
-            root.addView(card, cardParams)
-
-            val windowParams = WindowManager.LayoutParams(
-                WindowManager.LayoutParams.MATCH_PARENT,
-                WindowManager.LayoutParams.MATCH_PARENT,
+            val cardParams = WindowManager.LayoutParams(
+                WindowManager.LayoutParams.WRAP_CONTENT,
+                WindowManager.LayoutParams.WRAP_CONTENT,
                 WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
                 WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                    WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
-                    WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                    WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
                 PixelFormat.TRANSLUCENT
             ).apply {
                 gravity = Gravity.CENTER
             }
 
             runCatching {
-                windowManager.addView(root, windowParams)
-                curtainView = root
+                windowManager.addView(veil, veilParams)
+                veilView = veil
+                windowManager.addView(card, cardParams)
+                controlCardView = card
             }.onFailure {
+                dismissInternalOnMain()
                 activeFlag = false
             }
         }
     }
 
     fun dismiss(clearSessionDismissal: Boolean = false) {
+        val wasAttached = isShowing
         activeFlag = false
         if (clearSessionDismissal) {
             dismissedSessionKey = null
             activeSessionKey = null
         }
-        mainHandler.post {
+        if (wasAttached) {
+            lastHideOrDismissElapsedMs = SystemClock.elapsedRealtime()
+        }
+        runOnMain {
+            veilView?.visibility = View.INVISIBLE
+            controlCardView?.visibility = View.INVISIBLE
             dismissInternalOnMain()
         }
     }
 
     /**
-     * Temporarily makes the curtain invisible when OpenCV/Tesseract needs to inspect the actual
-     * underlying ad pixels via `takeScreenshot`, then restores visibility once capture finishes.
+     * Immediately sets curtain views to `View.INVISIBLE`, waits `50ms` for the WindowManager/SurfaceFlinger
+     * frame to clear cleanly, and invokes [onFrameCleared] (used before `takeScreenshot` and `dispatchGesture`).
      */
     fun hideTemporarilyForCapture(onReadyForCapture: () -> Unit) {
-        if (!activeFlag || curtainView == null) {
-            onReadyForCapture()
+        hideAndRunAfterFrameClear(onReadyForCapture)
+    }
+
+    fun hideAndRunAfterFrameClear(onFrameCleared: () -> Unit) {
+        val now = SystemClock.elapsedRealtime()
+        val hasViews = veilView != null || controlCardView != null
+        if (!hasViews) {
+            val sinceDismiss = now - lastHideOrDismissElapsedMs
+            if (lastHideOrDismissElapsedMs > 0L && sinceDismiss in 0 until AdCurtainLayoutPolicy.HIDE_SETTLE_DELAY_MS) {
+                mainHandler.postDelayed(
+                    { onFrameCleared() },
+                    AdCurtainLayoutPolicy.HIDE_SETTLE_DELAY_MS - sinceDismiss
+                )
+            } else {
+                onFrameCleared()
+            }
             return
         }
-        mainHandler.post {
-            val view = curtainView
-            if (view != null && view.visibility == View.VISIBLE) {
-                view.visibility = View.INVISIBLE
-                mainHandler.postDelayed({ onReadyForCapture() }, 70L)
+        runOnMain {
+            val veil = veilView
+            val card = controlCardView
+            val wasVisible = (veil?.visibility == View.VISIBLE) || (card?.visibility == View.VISIBLE)
+            veil?.visibility = View.INVISIBLE
+            card?.visibility = View.INVISIBLE
+            if (wasVisible) {
+                lastHideOrDismissElapsedMs = SystemClock.elapsedRealtime()
+                mainHandler.postDelayed({ onFrameCleared() }, AdCurtainLayoutPolicy.HIDE_SETTLE_DELAY_MS)
             } else {
-                onReadyForCapture()
+                val sinceHide = SystemClock.elapsedRealtime() - lastHideOrDismissElapsedMs
+                if (lastHideOrDismissElapsedMs > 0L && sinceHide in 0 until AdCurtainLayoutPolicy.HIDE_SETTLE_DELAY_MS) {
+                    mainHandler.postDelayed(
+                        { onFrameCleared() },
+                        AdCurtainLayoutPolicy.HIDE_SETTLE_DELAY_MS - sinceHide
+                    )
+                } else {
+                    onFrameCleared()
+                }
             }
         }
     }
 
     fun restoreAfterCapture() {
-        mainHandler.post {
-            val view = curtainView ?: return@post
+        runOnMain {
             val session = activeSessionKey
             if (activeFlag && (session == null || !isDismissedForSession(session))) {
-                view.visibility = View.VISIBLE
+                veilView?.visibility = View.VISIBLE
+                controlCardView?.visibility = View.VISIBLE
             }
         }
     }
 
+    private fun runOnMain(block: () -> Unit) {
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            block()
+        } else {
+            mainHandler.post(block)
+        }
+    }
+
+    private fun queryDisplaySizePx(): Pair<Int, Int> {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            val bounds = windowManager.currentWindowMetrics.bounds
+            bounds.width() to bounds.height()
+        } else {
+            val metrics = DisplayMetrics()
+            @Suppress("DEPRECATION")
+            windowManager.defaultDisplay.getRealMetrics(metrics)
+            metrics.widthPixels to metrics.heightPixels
+        }
+    }
+
     private fun dismissInternalOnMain() {
-        val view = curtainView ?: return
-        runCatching { windowManager.removeViewImmediate(view) }
-        curtainView = null
+        veilView?.let { v ->
+            v.visibility = View.INVISIBLE
+            runCatching { windowManager.removeViewImmediate(v) }
+        }
+        veilView = null
+        controlCardView?.let { c ->
+            c.visibility = View.INVISIBLE
+            runCatching { windowManager.removeViewImmediate(c) }
+        }
+        controlCardView = null
     }
 }

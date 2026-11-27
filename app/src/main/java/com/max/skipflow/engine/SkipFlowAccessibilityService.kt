@@ -473,6 +473,7 @@ class SkipFlowAccessibilityService : AccessibilityService() {
         if (pollingJob?.isActive == true) return
 
         pollingJob = serviceScope.launch {
+            var consecutiveNullWindows = 0
             while (isActive) {
                 delay(COUNTDOWN_POLLING_INTERVAL_MS)
                 val settings = repository.settings.value
@@ -485,7 +486,7 @@ class SkipFlowAccessibilityService : AccessibilityService() {
                     continue
                 }
 
-                // Every polling cycle: verify the true active `TYPE_APPLICATION` window in `service.windows`
+                // Every polling cycle (<= 500ms): verify the true active `TYPE_APPLICATION` window in `service.windows`
                 val nowElapsed = SystemClock.elapsedRealtime()
                 val liveActiveAppPkg = resolveActiveApplicationPackage(fallbackPackage = null)
                 val disabledPackages = repository.disabledPackages.value
@@ -506,6 +507,18 @@ class SkipFlowAccessibilityService : AccessibilityService() {
                     )
                 ) {
                     break
+                }
+
+                if (liveActiveAppPkg == null) {
+                    val stayAliveDuringAdTransition = (isAdScreenActive ||
+                        AdDetectionRules.isTtRewardExpressActivity(currentActivityClassName)) &&
+                        consecutiveNullWindows < 3
+                    if (stayAliveDuringAdTransition) {
+                        consecutiveNullWindows++
+                        continue
+                    }
+                } else {
+                    consecutiveNullWindows = 0
                 }
 
                 if (liveActiveAppPkg == null ||
@@ -556,7 +569,12 @@ class SkipFlowAccessibilityService : AccessibilityService() {
                 activeMonitoredPackage = liveActiveAppPkg
                 _currentActivePackage.value = liveActiveAppPkg
 
-                if (nowElapsed - lastScanElapsedMs >= POLLING_MIN_SCAN_GAP_MS) {
+                val minPollGap = if (AdDetectionRules.isTtRewardExpressActivity(currentActivityClassName)) {
+                    TT_EXPRESS_POLL_GAP_MS
+                } else {
+                    POLLING_MIN_SCAN_GAP_MS
+                }
+                if (nowElapsed - lastScanElapsedMs >= minPollGap) {
                     performMultiWindowScan(
                         monitoredPackage = liveActiveAppPkg,
                         nowElapsed = nowElapsed
@@ -1215,7 +1233,7 @@ class SkipFlowAccessibilityService : AccessibilityService() {
                         detectedDetail = String.format(Locale.US, "OCV=%.2f | بلا زر", ocvMaxScore)
                     }
                 }
-            } else if (targetBounds == null && isRealAdActivity && !hasTappedGooglePlayAdvance) {
+            } else if (isRealAdActivity && !hasTappedGooglePlayAdvance) {
                 // Fallback INSIDE confirmed Ad Activities ONLY: if no standard X/Skip exists,
                 // allow tapping top-corner "Google Play >>" or ">| Google Play" ONCE per ad session.
                 val ocrAdvanceBounds = fallbackGooglePlayAdvanceBounds
@@ -1624,6 +1642,11 @@ class SkipFlowAccessibilityService : AccessibilityService() {
                     )
 
                     if (explicitTarget != null) {
+                        val isUnclickablePlaceholderInTtExpress = !isWebViewNode &&
+                            AdDetectionRules.isTtRewardExpressActivity(currentActivityClassName) &&
+                            !clickableSelfOrParent &&
+                            text.isNullOrBlank() &&
+                            desc.isNullOrBlank()
                         val hasStorePillHierarchy = !isYouTube && hasStoreRedirectInHierarchy(node)
                         val isCountdownContainer = hasCountdownDescendant(node)
                         val targetBounds = resolveEffectiveBounds(node, screenW, screenH, tempRect)
@@ -1635,7 +1658,9 @@ class SkipFlowAccessibilityService : AccessibilityService() {
                             screenHeight = screenH,
                             viewId = viewId
                         )
-                        if (hasStorePillHierarchy &&
+                        if (isUnclickablePlaceholderInTtExpress) {
+                            // Wait until Pangle renders `>>` / `Skip` clickable or visible
+                        } else if (hasStorePillHierarchy &&
                             !isCountdownContainer &&
                             !isYouTube &&
                             allowGooglePlayAdvanceFallback &&
@@ -2375,22 +2400,25 @@ class SkipFlowAccessibilityService : AccessibilityService() {
             .addStroke(GestureDescription.StrokeDescription(path, 0L, 55L))
             .build()
 
-        dispatchGesture(
-            gesture,
-            object : GestureResultCallback() {
-                override fun onCompleted(gestureDescription: GestureDescription?) {
-                    onSkipGestureSucceeded(
-                        packageName = packageName,
-                        targetType = targetType,
-                        stageNumber = stageNumber,
-                        countAsNewAdSkip = countAsNewAdSkip,
-                        detectionMethod = detectionMethod,
-                        detectionDetail = detectionDetail
-                    )
-                }
-            },
-            mainHandler
-        )
+        adCurtainOverlayManager.hideAndRunAfterFrameClear {
+            if (!isEngineActiveAndNotSnoozed() || !powerManager.isInteractive) return@hideAndRunAfterFrameClear
+            dispatchGesture(
+                gesture,
+                object : GestureResultCallback() {
+                    override fun onCompleted(gestureDescription: GestureDescription?) {
+                        onSkipGestureSucceeded(
+                            packageName = packageName,
+                            targetType = targetType,
+                            stageNumber = stageNumber,
+                            countAsNewAdSkip = countAsNewAdSkip,
+                            detectionMethod = detectionMethod,
+                            detectionDetail = detectionDetail
+                        )
+                    }
+                },
+                mainHandler
+            )
+        }
     }
 
     private fun onSkipGestureSucceeded(
@@ -2865,6 +2893,7 @@ class SkipFlowAccessibilityService : AccessibilityService() {
         private const val WINDOW_STATE_SCAN_GAP_MS = 50L
         private const val COUNTDOWN_POLLING_INTERVAL_MS = 400L
         private const val POLLING_MIN_SCAN_GAP_MS = 380L
+        private const val TT_EXPRESS_POLL_GAP_MS = 320L
         private const val VISION_FALLBACK_COOLDOWN_MS = 800L
         private const val UNCONFIRMED_OCR_COOLDOWN_MS = 1_800L
         private const val SPARSE_TREE_NODE_THRESHOLD = 25

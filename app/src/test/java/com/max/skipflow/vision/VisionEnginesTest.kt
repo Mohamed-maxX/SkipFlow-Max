@@ -60,6 +60,7 @@ class VisionEnginesTest {
                 threshold = OpenCvTemplateEvaluator.thresholdForContext(isConfirmedAdActivity = true)
             )
         )
+        assertTrue(OpenCvTemplateEvaluator.SCALES.any { kotlin.math.abs(it - 0.85f) < 0.001f })
     }
 
     @Test

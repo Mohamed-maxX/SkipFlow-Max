@@ -397,7 +397,7 @@ object AdDetectionRules {
         val idSuffix = extractViewIdSuffix(viewIdResourceName) ?: return false
         return (idSuffix.startsWith("al_") && (idSuffix.contains("close") || idSuffix.contains("skip"))) ||
             (idSuffix.startsWith("unity") && (idSuffix.contains("close") || idSuffix.contains("skip"))) ||
-            (idSuffix.startsWith("tt_") && idSuffix.contains("close")) ||
+            (idSuffix.startsWith("tt_") && (idSuffix.contains("close") || idSuffix.contains("skip"))) ||
             (idSuffix.startsWith("mbridge_") && idSuffix.contains("close"))
     }
 
@@ -557,7 +557,7 @@ object AdDetectionRules {
                 (idSuffix != null && (
                     (idSuffix.startsWith("al_") && (idSuffix.contains("close") || idSuffix.contains("skip"))) ||
                         (idSuffix.startsWith("unity") && (idSuffix.contains("close") || idSuffix.contains("skip"))) ||
-                        (idSuffix.startsWith("tt_") && idSuffix.contains("close")) ||
+                        (idSuffix.startsWith("tt_") && (idSuffix.contains("close") || idSuffix.contains("skip"))) ||
                         (idSuffix.startsWith("mbridge_") && idSuffix.contains("close"))
                     ))
             ) {

@@ -130,6 +130,17 @@ class AdDetectionRulesTest {
             )
         )
         assertEquals(
+            AdTargetType.GAME_AD_SKIP,
+            AdDetectionRules.matchCandidate(
+                packageName = "com.game.play",
+                viewIdResourceName = "com.game.play:id/tt_top_skip",
+                text = null,
+                contentDescription = null,
+                isClickableOrHasClickableParent = true,
+                isAdActivityContext = false
+            )
+        )
+        assertEquals(
             AdTargetType.GAME_AD_CONTINUE,
             AdDetectionRules.matchCandidate(
                 packageName = "com.game.play",
