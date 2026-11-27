@@ -302,5 +302,14 @@ class AdDetectionRulesTest {
         assertTrue(AdDetectionRules.hasStorePickerDialogText("حدد متجر تطبيقات", null))
         assertTrue(AdDetectionRules.hasStorePickerDialogText("متجر Play", "GetApps"))
         assertFalse(AdDetectionRules.isAppChooserPackageOrActivity("com.game.play", "TTRewardExpressVideoActivity"))
+
+        // Confirmed-Ad Stage-1 Google Play advance pills vs non-Google-Play store pills
+        assertTrue(AdDetectionRules.isGooglePlayAdvancePill("Google Play >>", null))
+        assertTrue(AdDetectionRules.isGooglePlayAdvancePill(">| Google Play", null))
+        assertTrue(AdDetectionRules.isGooglePlayAdvancePill("> | Google Play", null))
+        assertFalse(AdDetectionRules.isGooglePlayAdvancePill("Install >>", null))
+        assertFalse(AdDetectionRules.isGooglePlayAdvancePill("Google Play", null))
+        assertTrue(AdDetectionRules.isNonGooglePlayStoreKeyword(null, "GetApps >", null))
+        assertFalse(AdDetectionRules.isNonGooglePlayStoreKeyword(null, "Google Play >>", null))
     }
 }

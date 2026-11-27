@@ -27,6 +27,7 @@ class PlayStoreRedirectGuard(
     private var lastAdActiveAtMs: Long = 0L
     private var lastAdPackage: String? = null
     private var lastChooserBounceAtMs: Long = 0L
+    private val recentBounceTimestamps = mutableListOf<Long>()
 
     fun recordGameOrAdSkipAttempt(
         packageName: String,
@@ -35,7 +36,8 @@ class PlayStoreRedirectGuard(
         bounds: BoundsRect? = null,
         screenWidth: Int = 0,
         screenHeight: Int = 0,
-        viewId: String? = null
+        viewId: String? = null,
+        isGooglePlayAdvance: Boolean = false
     ) {
         if (packageName == AdDetectionRules.YOUTUBE_PACKAGE ||
             AdDetectionRules.isStrictlyExcludedPackage(packageName)
@@ -45,7 +47,7 @@ class PlayStoreRedirectGuard(
         lastAttemptAtMs = nowMs
         lastAttemptPackage = packageName
         bouncedForCurrentAttempt = false
-        lastAttemptInfo = if (bounds != null && screenWidth > 0 && screenHeight > 0) {
+        lastAttemptInfo = if (!isGooglePlayAdvance && bounds != null && screenWidth > 0 && screenHeight > 0) {
             TappedSkipCandidateInfo(
                 packageName = packageName,
                 activityName = activityName,
@@ -104,38 +106,42 @@ class PlayStoreRedirectGuard(
 
         if (!isPlayStore && !isAppOrStoreChooser) return false
 
+        // Prevent duplicate back-presses on rapid consecutive events for the same transition.
+        if (lastChooserBounceAtMs > 0L && (nowMs - lastChooserBounceAtMs) in 0 until CHOOSER_BOUNCE_COOLDOWN_MS) {
+            return false
+        }
+
+        // Safety guard: allow at most 2 automatic bounce-backs within 10 seconds so a user
+        // intentionally opening Play Store is never trapped.
+        recentBounceTimestamps.removeAll { it < nowMs - BOUNCE_RATE_WINDOW_MS || it > nowMs }
+        if (recentBounceTimestamps.size >= MAX_BOUNCES_PER_WINDOW) {
+            return false
+        }
+
         val withinSkipAttempt = lastAttemptPackage != null &&
             lastAttemptAtMs > 0L &&
             !bouncedForCurrentAttempt &&
             (nowMs - lastAttemptAtMs) in 0..redirectWindowMs
 
-        if (isPlayStore) {
-            if (withinSkipAttempt) {
-                bouncedForCurrentAttempt = true
-                lastChooserBounceAtMs = nowMs
-                lastRedirectedTrapInfo = lastAttemptInfo
-                return true
-            }
+        val activeAdRecently = isWithinActiveAdWindow(nowMs)
+        if (!withinSkipAttempt && !activeAdRecently) {
             return false
         }
 
-        // App Chooser / Store Picker ("android", ResolverActivity, ChooserActivity, "متجر Play", "GetApps", "حدد متجر تطبيقات")
-        if (nowMs - lastChooserBounceAtMs in 0 until CHOOSER_BOUNCE_COOLDOWN_MS) {
-            return false
-        }
-
-        if (withinSkipAttempt || isWithinActiveAdWindow(nowMs)) {
+        if (withinSkipAttempt) {
             bouncedForCurrentAttempt = true
-            lastChooserBounceAtMs = nowMs
-            lastRedirectedTrapInfo = if (withinSkipAttempt) lastAttemptInfo else null
-            return true
         }
-        return false
+        lastChooserBounceAtMs = nowMs
+        recentBounceTimestamps.add(nowMs)
+        lastRedirectedTrapInfo = if (withinSkipAttempt) lastAttemptInfo else null
+        return true
     }
 
     companion object {
         const val REDIRECT_WINDOW_MS = 3_000L
-        const val ACTIVE_AD_WINDOW_MS = 5_000L
-        const val CHOOSER_BOUNCE_COOLDOWN_MS = 1_800L
+        const val ACTIVE_AD_WINDOW_MS = 10_000L
+        const val CHOOSER_BOUNCE_COOLDOWN_MS = 1_500L
+        const val BOUNCE_RATE_WINDOW_MS = 10_000L
+        const val MAX_BOUNCES_PER_WINDOW = 2
     }
 }

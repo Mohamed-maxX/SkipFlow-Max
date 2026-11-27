@@ -114,4 +114,58 @@ class PlayStoreRedirectGuardTest {
         assertEquals(trapBounds.centerY / 2400f, tappedInfo.normCenterY, 0.001f)
         assertNull(guard.consumeRedirectedTapInfo())
     }
+
+    @Test
+    fun `unconditionally bounces back from Play Store within 10s of ad without SkipFlow tap, max 2 per 10s, never Fake-X on Google Play advance`() {
+        val guard = PlayStoreRedirectGuard()
+        guard.markActiveAdContext("com.example.game", nowMs = 50_000L)
+
+        // Auto-redirect or user tap 6s later (no SkipFlow tap recorded) -> bounces back (1/2)
+        assertTrue(
+            guard.shouldBounceBack(
+                enteredPackage = AdDetectionRules.PLAY_STORE_PACKAGE,
+                bounceBackEnabled = true,
+                nowMs = 56_000L
+            )
+        )
+        assertNull(guard.consumeRedirectedTapInfo())
+
+        // Google Play >> advance tap also opens Play Store -> bounces back (2/2) and NEVER logs Fake-X
+        guard.recordGameOrAdSkipAttempt(
+            packageName = "com.example.game",
+            nowMs = 57_800L,
+            bounds = BoundsRect(40, 60, 320, 130),
+            screenWidth = 1080,
+            screenHeight = 2400,
+            isGooglePlayAdvance = true
+        )
+        assertTrue(
+            guard.shouldBounceBack(
+                enteredPackage = AdDetectionRules.PLAY_STORE_PACKAGE,
+                bounceBackEnabled = true,
+                nowMs = 58_400L
+            )
+        )
+        assertNull(guard.consumeRedirectedTapInfo())
+
+        // 3rd bounce attempt inside the same 10s window is blocked so user is never trapped
+        guard.markActiveAdContext("com.example.game", nowMs = 59_500L)
+        assertFalse(
+            guard.shouldBounceBack(
+                enteredPackage = AdDetectionRules.PLAY_STORE_PACKAGE,
+                bounceBackEnabled = true,
+                nowMs = 60_500L
+            )
+        )
+
+        // Once older bounces age past 10s, protection works again
+        guard.markActiveAdContext("com.example.game", nowMs = 70_000L)
+        assertTrue(
+            guard.shouldBounceBack(
+                enteredPackage = AdDetectionRules.PLAY_STORE_PACKAGE,
+                bounceBackEnabled = true,
+                nowMs = 70_600L
+            )
+        )
+    }
 }

@@ -35,6 +35,7 @@ import com.max.skipflow.vision.DetectedIconShape
 import com.max.skipflow.vision.OpenCvAdIconDetector
 import com.max.skipflow.vision.OpenCvTemplateEvaluator
 import com.max.skipflow.vision.TesseractOcrEngine
+import com.max.skipflow.vision.VisualIconDetection
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -82,6 +83,8 @@ class SkipFlowAccessibilityService : AccessibilityService() {
     private var currentActivityClassName: String? = null
     @Volatile
     private var isAdScreenActive: Boolean = false
+    @Volatile
+    private var hasTappedGooglePlayAdvance: Boolean = false
     private var adCurtainSuppressedSessionKey: String? = null
     private var lastScanElapsedMs: Long = 0L
     private var lastVisionScanStartedMs: Long = 0L
@@ -92,6 +95,11 @@ class SkipFlowAccessibilityService : AccessibilityService() {
     private var lastScreenshotStatus: String = "-"
     private var lastDebugDetail: String = "جاهز"
     private var pendingVolumeRestoreRunnable: Runnable? = null
+    private var pendingBounceBackRunnable: Runnable? = null
+    private var pendingResumeAfterBounceRunnable: Runnable? = null
+    private var preRedirectAdPackage: String? = null
+    private var preRedirectAdActivityClass: String? = null
+    private var preRedirectHadGooglePlayAdvance: Boolean = false
     private var isScreenReceiverRegistered: Boolean = false
     private val appNameCache = mutableMapOf<String, String>()
 
@@ -194,61 +202,31 @@ class SkipFlowAccessibilityService : AccessibilityService() {
         val isWindowChange = event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED
         val isTransientOverlay = AdDetectionRules.isTransientOverlayPackage(eventPkg, packageName)
 
+        if (isWindowChange && !isTransientOverlay && AdDetectionRules.isLauncherPackage(eventPkg)) {
+            cancelPendingBounceBack()
+            playStoreRedirectGuard.clearOnLauncherOrUserExit()
+        }
+
         // Anti-Redirect Bounce-Back + Fake-X Learning:
-        // Return user once if an ad click or auto-redirect opens Play Store (`com.android.vending`)
-        // or Android's app chooser / store picker (`android` / `ResolverActivity` / `ChooserActivity`),
-        // and remember the redirected corner button as a Fake-X Trap for 24 hours.
-        if (!isTransientOverlay) {
-            val isChooserOrWindow = isWindowChange ||
-                AdDetectionRules.isAppChooserPackageOrActivity(eventPkg, event.className)
-            if (isChooserOrWindow) {
-                val chooserDialogDetected = hasStorePickerContent(event, eventPkg)
-                if (playStoreRedirectGuard.shouldBounceBack(
-                        enteredPackage = eventPkg,
-                        bounceBackEnabled = currentSettings.bounceBackFromPlayStore,
-                        nowMs = nowElapsed,
-                        enteredClassName = event.className,
-                        hasStoreChooserContent = chooserDialogDetected
-                    )
-                ) {
-                    val redirectedTap = playStoreRedirectGuard.consumeRedirectedTapInfo()
-                    if (redirectedTap != null) {
-                        repository.recordFakeXTrap(
-                            packageName = redirectedTap.packageName,
-                            activityName = redirectedTap.activityName,
-                            normCenterX = redirectedTap.normCenterX,
-                            normCenterY = redirectedTap.normCenterY,
-                            viewId = redirectedTap.viewId
-                        )
-                    }
-                    stopCountdownPolling()
-                    activeMonitoredPackage = null
-                    _currentActivePackage.value = null
-                    dismissAdCurtainAndRestoreAudio(clearSessionSuppression = true)
-                    performGlobalAction(GLOBAL_ACTION_BACK)
-                    emitStatusUpdate(
-                        pkg = eventPkg,
-                        isAdScreen = false,
-                        screenshotStatus = "-",
-                        detail = when {
-                            redirectedTap != null -> "حظر زر X وهمي (24 ساعة) والرجوع"
-                            eventPkg == AdDetectionRules.PLAY_STORE_PACKAGE -> "رجوع تلقائي من المتجر"
-                            else -> "إغلاق نافذة اختيار المتجر"
-                        }
-                    )
-                    return
-                }
-            }
+        // Unconditionally bounce back after 400ms settle delay if transitioning from an active Ad Activity
+        // (or recent ad within 10s) to Play Store (`com.android.vending`, full-screen OR in-app overlay bottom-sheet)
+        // or Android's store picker (`ResolverActivity` / `ChooserActivity`), capped at max 2 bounces per 10s.
+        if (!isTransientOverlay &&
+            tryHandleStoreRedirectBounceBack(
+                eventPkg = eventPkg,
+                eventClassName = event.className,
+                event = event,
+                bounceBackEnabled = currentSettings.bounceBackFromPlayStore,
+                nowElapsed = nowElapsed
+            )
+        ) {
+            return
         }
 
         // Never overwrite currentActivityPackage / currentActivityClassName from transient overlays
         // (`com.android.systemui`, screen recorders, keyboards, or SkipFlow Max's overlay).
         if (isWindowChange && !isTransientOverlay) {
             updateCurrentActivityTracking(eventPkg, event.className)
-
-            if (AdDetectionRules.isLauncherPackage(eventPkg)) {
-                playStoreRedirectGuard.clearOnLauncherOrUserExit()
-            }
         }
 
         if (isTransientOverlay && !isWindowChange) {
@@ -363,6 +341,7 @@ class SkipFlowAccessibilityService : AccessibilityService() {
         stopCountdownPolling()
         stopSnoozeCountdownTicker()
         cancelPendingVolumeRestore()
+        cancelPendingBounceBack()
         dismissAdCurtainAndRestoreAudio(clearSessionSuppression = true)
         volumeController.forceRestore()
         debugOverlayManager.hide()
@@ -375,6 +354,7 @@ class SkipFlowAccessibilityService : AccessibilityService() {
         stopCountdownPolling()
         stopSnoozeCountdownTicker()
         cancelPendingVolumeRestore()
+        cancelPendingBounceBack()
         dismissAdCurtainAndRestoreAudio(clearSessionSuppression = true)
         volumeController.forceRestore()
         debugOverlayManager.hide()
@@ -392,6 +372,7 @@ class SkipFlowAccessibilityService : AccessibilityService() {
         stopSnoozeCountdownTicker()
         settingsObserverJob?.cancel()
         cancelPendingVolumeRestore()
+        cancelPendingBounceBack()
         dismissAdCurtainAndRestoreAudio(clearSessionSuppression = true)
         volumeController.forceRestore()
         debugOverlayManager.hide()
@@ -411,6 +392,7 @@ class SkipFlowAccessibilityService : AccessibilityService() {
 
     private fun clearStaleAdState(newPackage: String? = currentActivityPackage) {
         isAdScreenActive = false
+        hasTappedGooglePlayAdvance = false
         dismissAdCurtainAndRestoreAudio(clearSessionSuppression = true)
         if (newPackage != currentActivityPackage) {
             currentActivityPackage = newPackage
@@ -434,6 +416,7 @@ class SkipFlowAccessibilityService : AccessibilityService() {
             currentActivityPackage = eventPkg
             currentActivityClassName = cls
             isAdScreenActive = isNewAdActivity
+            hasTappedGooglePlayAdvance = false
             lastScreenshotStatus = "-"
             lastDebugDetail = "انتقال"
             visionGenerationId.incrementAndGet()
@@ -458,6 +441,7 @@ class SkipFlowAccessibilityService : AccessibilityService() {
             currentActivityClassName = cls
             isAdScreenActive = isNewAdActivity
             if (wasRealAd != isNewAdActivity) {
+                hasTappedGooglePlayAdvance = false
                 visionGenerationId.incrementAndGet()
                 lastScreenshotStatus = "-"
                 if (isNewAdActivity) {
@@ -506,12 +490,43 @@ class SkipFlowAccessibilityService : AccessibilityService() {
                 val liveActiveAppPkg = resolveActiveApplicationPackage(fallbackPackage = null)
                 val disabledPackages = repository.disabledPackages.value
 
+                if (pendingBounceBackRunnable != null) {
+                    continue
+                }
+
+                // Catch in-app Play Store overlay bottom-sheets or chooser dialogs appearing between events
+                val storeOrChooserOverlayPkg = findVisibleStoreOrChooserWindowPackage()
+                if (storeOrChooserOverlayPkg != null &&
+                    tryHandleStoreRedirectBounceBack(
+                        eventPkg = storeOrChooserOverlayPkg,
+                        eventClassName = null,
+                        event = null,
+                        bounceBackEnabled = settings.bounceBackFromPlayStore,
+                        nowElapsed = nowElapsed
+                    )
+                ) {
+                    break
+                }
+
                 if (liveActiveAppPkg == null ||
                     liveActiveAppPkg == packageName ||
                     AdDetectionRules.isStrictlyExcludedPackage(liveActiveAppPkg) ||
                     AdDetectionRules.isTransientOverlayPackage(liveActiveAppPkg, packageName) ||
                     liveActiveAppPkg in disabledPackages
                 ) {
+                    if (liveActiveAppPkg != null &&
+                        (liveActiveAppPkg == AdDetectionRules.PLAY_STORE_PACKAGE ||
+                            AdDetectionRules.isAppChooserPackageOrActivity(liveActiveAppPkg, null)) &&
+                        tryHandleStoreRedirectBounceBack(
+                            eventPkg = liveActiveAppPkg,
+                            eventClassName = null,
+                            event = null,
+                            bounceBackEnabled = settings.bounceBackFromPlayStore,
+                            nowElapsed = nowElapsed
+                        )
+                    ) {
+                        break
+                    }
                     clearStaleAdState(newPackage = null)
                     activeMonitoredPackage = null
                     _currentActivePackage.value = null
@@ -650,11 +665,13 @@ class SkipFlowAccessibilityService : AccessibilityService() {
                     continue
                 }
 
+                val rootRealAdActivity = realAdActivityActive || isCurrentActivityRealAdScreen(rootPkg)
                 val result = scanWindowTree(
                     root = root,
                     monitoredPackage = rootPkg,
-                    isRealAdActivity = realAdActivityActive || isCurrentActivityRealAdScreen(rootPkg),
+                    isRealAdActivity = rootRealAdActivity,
                     preferTopLeftCorner = preferTopLeftCorner,
+                    allowGooglePlayAdvanceFallback = rootRealAdActivity && !hasTappedGooglePlayAdvance,
                     collectSocialSignals = currentSettings.autoSwipeSocialAdsEnabled &&
                         SocialAutoSwipeDetector.isSupportedSocialPackage(rootPkg),
                     collectAnnoyanceObservations = currentSettings.annoyanceKillerEnabled &&
@@ -757,8 +774,18 @@ class SkipFlowAccessibilityService : AccessibilityService() {
                 )
 
                 if (decision is StageDecision.ExecuteTap) {
+                    if (explicitWinner.isGooglePlayAdvance && (!realAdActivityActive || hasTappedGooglePlayAdvance)) {
+                        return
+                    }
                     dismissAdCurtainAndRestoreAudio(suppressForCurrentSession = true)
-                    if (!isYouTubeAction) {
+                    if (explicitWinner.isGooglePlayAdvance) {
+                        hasTappedGooglePlayAdvance = true
+                        playStoreRedirectGuard.recordGameOrAdSkipAttempt(
+                            packageName = monitoredPackage,
+                            nowMs = nowElapsed,
+                            isGooglePlayAdvance = true
+                        )
+                    } else if (!isYouTubeAction) {
                         playStoreRedirectGuard.recordGameOrAdSkipAttempt(
                             packageName = monitoredPackage,
                             nowMs = nowElapsed,
@@ -771,11 +798,16 @@ class SkipFlowAccessibilityService : AccessibilityService() {
                     } else {
                         playStoreRedirectGuard.recordGameOrAdSkipAttempt(monitoredPackage, nowElapsed)
                     }
+                    val actionDetail = if (explicitWinner.isGooglePlayAdvance) {
+                        "Google Play >> (مرحلة 1)"
+                    } else {
+                        explicitWinner.targetType.name
+                    }
                     pushDebugOverlay(
                         pkg = monitoredPackage,
                         isAdScreen = true,
                         screenshotStatus = lastScreenshotStatus,
-                        detail = "A11y: ${explicitWinner.targetType.name}"
+                        detail = "A11y: $actionDetail"
                     )
                     executeTargetAction(
                         packageName = monitoredPackage,
@@ -783,7 +815,7 @@ class SkipFlowAccessibilityService : AccessibilityService() {
                         stageNumber = decision.stageNumber,
                         countAsNewAdSkip = decision.countAsNewAdSkip,
                         detectionMethod = SkipDetectionMethod.ACCESSIBILITY,
-                        detectionDetail = explicitWinner.targetType.name
+                        detectionDetail = actionDetail
                     )
                 } else if (decision is StageDecision.Ignore) {
                     if (realAdActivityActive && currentSettings.adCurtainEnabled && hasCountdownTreeNode) {
@@ -1031,6 +1063,11 @@ class SkipFlowAccessibilityService : AccessibilityService() {
             screenWidth = screenW,
             screenHeight = screenH
         )
+        var fallbackGooglePlayAdvanceBounds: BoundsRect? = null
+        var fallbackGooglePlayAdvanceLabel: String? = null
+        var rawChevronHit: VisualIconDetection? = null
+        val discoveredGooglePlayRects = mutableListOf<BoundsRect>()
+        var isGooglePlayAdvanceVisionTap = false
 
         // 1. Strict Gate: ONLY run OpenCV & Corner OCR upfront when screen is
         //    either a confirmed AdActivity (`>= 0.68`) OR actively displaying explicit ad text (`>= 0.78`).
@@ -1050,6 +1087,7 @@ class SkipFlowAccessibilityService : AccessibilityService() {
             var precomputedCornerOcr: com.max.skipflow.vision.OcrAdScanResult? = null
             val chevronHit = ocvSummary.detection
             if (chevronHit != null && chevronHit.shape == DetectedIconShape.DOUBLE_CHEVRON) {
+                rawChevronHit = chevronHit
                 val cornerOcr = tesseractOcrEngine.recognizeCornerControls(
                     softwareScreenshot = softwareBitmap,
                     screenWidth = screenW,
@@ -1057,6 +1095,11 @@ class SkipFlowAccessibilityService : AccessibilityService() {
                     excludedRects = effectiveExcludedRects
                 )
                 precomputedCornerOcr = cornerOcr
+                discoveredGooglePlayRects.addAll(cornerOcr.googlePlayRects)
+                if (fallbackGooglePlayAdvanceBounds == null && cornerOcr.googlePlayAdvanceBounds != null) {
+                    fallbackGooglePlayAdvanceBounds = cornerOcr.googlePlayAdvanceBounds
+                    fallbackGooglePlayAdvanceLabel = cornerOcr.googlePlayAdvanceKeyword
+                }
                 if (cornerOcr.storeExclusionRects.isNotEmpty()) {
                     effectiveExcludedRects = effectiveExcludedRects + cornerOcr.storeExclusionRects
                     if (OpenCvTemplateEvaluator.isInsideExcludedRect(chevronHit.centerX, chevronHit.centerY, effectiveExcludedRects)) {
@@ -1091,6 +1134,11 @@ class SkipFlowAccessibilityService : AccessibilityService() {
                     screenHeight = screenH,
                     excludedRects = effectiveExcludedRects
                 )
+                discoveredGooglePlayRects.addAll(cornerOcr.googlePlayRects)
+                if (fallbackGooglePlayAdvanceBounds == null && cornerOcr.googlePlayAdvanceBounds != null) {
+                    fallbackGooglePlayAdvanceBounds = cornerOcr.googlePlayAdvanceBounds
+                    fallbackGooglePlayAdvanceLabel = cornerOcr.googlePlayAdvanceKeyword
+                }
                 if (cornerOcr.storeExclusionRects.isNotEmpty()) {
                     effectiveExcludedRects = effectiveExcludedRects + cornerOcr.storeExclusionRects
                 }
@@ -1114,6 +1162,11 @@ class SkipFlowAccessibilityService : AccessibilityService() {
                 isRealAdActivity = confirmedBeforeOcr,
                 excludedRects = effectiveExcludedRects
             )
+            discoveredGooglePlayRects.addAll(ocrResult.googlePlayRects)
+            if (fallbackGooglePlayAdvanceBounds == null && ocrResult.googlePlayAdvanceBounds != null) {
+                fallbackGooglePlayAdvanceBounds = ocrResult.googlePlayAdvanceBounds
+                fallbackGooglePlayAdvanceLabel = ocrResult.googlePlayAdvanceKeyword
+            }
             val combinedExcludedRects = effectiveExcludedRects + ocrResult.storeExclusionRects
             if (ocrResult.hasAdContext) {
                 detectedAsAd = true
@@ -1161,6 +1214,34 @@ class SkipFlowAccessibilityService : AccessibilityService() {
                     } else {
                         detectedDetail = String.format(Locale.US, "OCV=%.2f | بلا زر", ocvMaxScore)
                     }
+                }
+            } else if (targetBounds == null && isRealAdActivity && !hasTappedGooglePlayAdvance) {
+                // Fallback INSIDE confirmed Ad Activities ONLY: if no standard X/Skip exists,
+                // allow tapping top-corner "Google Play >>" or ">| Google Play" ONCE per ad session.
+                val ocrAdvanceBounds = fallbackGooglePlayAdvanceBounds
+                val ocvChevronOverPlay = rawChevronHit?.takeIf { chevron ->
+                    chevron.centerY <= screenH * 0.34f &&
+                        discoveredGooglePlayRects.isNotEmpty() &&
+                        OpenCvTemplateEvaluator.isInsideExcludedRect(
+                            chevron.centerX,
+                            chevron.centerY,
+                            discoveredGooglePlayRects
+                        )
+                }
+                if (ocrAdvanceBounds != null) {
+                    targetBounds = ocrAdvanceBounds
+                    targetType = AdTargetType.GAME_AD_SKIP
+                    detectedMethod = SkipDetectionMethod.OCR
+                    detectedDetail = "OCR PlayAdvance: ${fallbackGooglePlayAdvanceLabel ?: "Google Play >>"}"
+                    isGooglePlayAdvanceVisionTap = true
+                } else if (ocvChevronOverPlay != null) {
+                    targetBounds = ocvChevronOverPlay.boundsOnScreen
+                    targetType = AdTargetType.GAME_AD_ICON
+                    detectedMethod = SkipDetectionMethod.OPENCV
+                    detectedDetail = "OCV PlayAdvance >>"
+                    isGooglePlayAdvanceVisionTap = true
+                } else {
+                    detectedDetail = String.format(Locale.US, "OCV=%.2f | OCR: بلا زر", ocvMaxScore)
                 }
             } else if (detectedAsAd) {
                 detectedDetail = String.format(Locale.US, "OCV=%.2f | OCR: بلا زر", ocvMaxScore)
@@ -1211,16 +1292,30 @@ class SkipFlowAccessibilityService : AccessibilityService() {
                 nowMs = nowMs
             )
             if (decision is StageDecision.ExecuteTap) {
+                if (isGooglePlayAdvanceVisionTap &&
+                    (hasTappedGooglePlayAdvance || !isCurrentActivityRealAdScreen(expectedPackage))
+                ) {
+                    return@withContext
+                }
                 dismissAdCurtainAndRestoreAudio(suppressForCurrentSession = true)
-                playStoreRedirectGuard.recordGameOrAdSkipAttempt(
-                    packageName = expectedPackage,
-                    nowMs = nowMs,
-                    activityName = currentActivityClassName,
-                    bounds = resolvedBounds,
-                    screenWidth = screenW,
-                    screenHeight = screenH,
-                    viewId = null
-                )
+                if (isGooglePlayAdvanceVisionTap) {
+                    hasTappedGooglePlayAdvance = true
+                    playStoreRedirectGuard.recordGameOrAdSkipAttempt(
+                        packageName = expectedPackage,
+                        nowMs = nowMs,
+                        isGooglePlayAdvance = true
+                    )
+                } else {
+                    playStoreRedirectGuard.recordGameOrAdSkipAttempt(
+                        packageName = expectedPackage,
+                        nowMs = nowMs,
+                        activityName = currentActivityClassName,
+                        bounds = resolvedBounds,
+                        screenWidth = screenW,
+                        screenHeight = screenH,
+                        viewId = null
+                    )
+                }
                 pushDebugOverlay(
                     pkg = expectedPackage,
                     isAdScreen = true,
@@ -1336,7 +1431,8 @@ class SkipFlowAccessibilityService : AccessibilityService() {
         val bounds: BoundsRect,
         val priority: Int,
         val viewId: String?,
-        var nodeCopy: AccessibilityNodeInfo?
+        var nodeCopy: AccessibilityNodeInfo?,
+        val isGooglePlayAdvance: Boolean = false
     ) {
         fun recycleNode(service: SkipFlowAccessibilityService) {
             nodeCopy?.let { service.safeRecycle(it) }
@@ -1370,6 +1466,7 @@ class SkipFlowAccessibilityService : AccessibilityService() {
         monitoredPackage: String,
         isRealAdActivity: Boolean,
         preferTopLeftCorner: Boolean,
+        allowGooglePlayAdvanceFallback: Boolean = false,
         collectSocialSignals: Boolean = false,
         collectAnnoyanceObservations: Boolean = false
     ): TreeScanResult {
@@ -1391,10 +1488,12 @@ class SkipFlowAccessibilityService : AccessibilityService() {
         val annoyanceObservations = if (collectAnnoyanceObservations) mutableListOf<AnnoyanceNodeObservation>() else null
         var explicitBestCandidate: CandidateMatch? = null
         var contextGatedBestCandidate: CandidateMatch? = null
+        var googlePlayAdvanceCandidate: CandidateMatch? = null
         val cornerIconCandidates = mutableListOf<CornerIconCandidate>()
         val excludedRects = mutableListOf<BoundsRect>()
         val tempRect = Rect()
         val isYouTube = monitoredPackage == AdDetectionRules.YOUTUBE_PACKAGE
+        val maxTopAdvanceY = (screenH * 0.34f).toInt()
 
         while (queue.isNotEmpty() && visitedNodes < MAX_SCAN_NODES) {
             val (node, depth, insideWebView) = queue.removeFirst()
@@ -1492,6 +1591,29 @@ class SkipFlowAccessibilityService : AccessibilityService() {
                     }
 
                     val clickableSelfOrParent = node.isClickable || isAncestorClickable(node)
+                    if (!isYouTube &&
+                        allowGooglePlayAdvanceFallback &&
+                        googlePlayAdvanceCandidate == null &&
+                        AdDetectionRules.isGooglePlayAdvancePill(text, desc) &&
+                        !AdDetectionRules.isNonGooglePlayStoreKeyword(viewId, text, desc) &&
+                        !hasCountdownDescendant(node)
+                    ) {
+                        val playBounds = resolveEffectiveBounds(node, screenW, screenH, tempRect)
+                        if (!playBounds.isEmpty &&
+                            playBounds.centerY in 2..maxTopAdvanceY &&
+                            playBounds.width <= screenW * 0.72f
+                        ) {
+                            googlePlayAdvanceCandidate = CandidateMatch(
+                                targetType = AdTargetType.GAME_AD_SKIP,
+                                bounds = playBounds,
+                                priority = priorityFor(AdTargetType.GAME_AD_SKIP),
+                                viewId = viewId,
+                                nodeCopy = obtainNodeCopy(node),
+                                isGooglePlayAdvance = true
+                            )
+                        }
+                    }
+
                     val explicitTarget = AdDetectionRules.matchCandidate(
                         packageName = monitoredPackage,
                         viewIdResourceName = viewId,
@@ -1513,7 +1635,23 @@ class SkipFlowAccessibilityService : AccessibilityService() {
                             screenHeight = screenH,
                             viewId = viewId
                         )
-                        if (!hasStorePillHierarchy &&
+                        if (hasStorePillHierarchy &&
+                            !isCountdownContainer &&
+                            !isYouTube &&
+                            allowGooglePlayAdvanceFallback &&
+                            googlePlayAdvanceCandidate == null &&
+                            targetBounds.centerY in 2..maxTopAdvanceY &&
+                            hasGooglePlayOnlyInHierarchy(node)
+                        ) {
+                            googlePlayAdvanceCandidate = CandidateMatch(
+                                targetType = explicitTarget,
+                                bounds = targetBounds,
+                                priority = priorityFor(explicitTarget),
+                                viewId = viewId,
+                                nodeCopy = obtainNodeCopy(node),
+                                isGooglePlayAdvance = true
+                            )
+                        } else if (!hasStorePillHierarchy &&
                             !isCountdownContainer &&
                             !isKnownFakeTrap &&
                             SafeZoneEvaluator.isWithinSafeZone(targetBounds, screenW, screenH, explicitTarget)
@@ -1555,7 +1693,22 @@ class SkipFlowAccessibilityService : AccessibilityService() {
                                 screenHeight = screenH,
                                 viewId = viewId
                             )
-                            if (!hasStorePillHierarchy &&
+                            if (hasStorePillHierarchy &&
+                                !isCountdownContainer &&
+                                allowGooglePlayAdvanceFallback &&
+                                googlePlayAdvanceCandidate == null &&
+                                targetBounds.centerY in 2..maxTopAdvanceY &&
+                                hasGooglePlayOnlyInHierarchy(node)
+                            ) {
+                                googlePlayAdvanceCandidate = CandidateMatch(
+                                    targetType = contextualTarget,
+                                    bounds = targetBounds,
+                                    priority = priorityFor(contextualTarget),
+                                    viewId = viewId,
+                                    nodeCopy = obtainNodeCopy(node),
+                                    isGooglePlayAdvance = true
+                                )
+                            } else if (!hasStorePillHierarchy &&
                                 !isCountdownContainer &&
                                 !isKnownFakeTrap &&
                                 SafeZoneEvaluator.isWithinSafeZone(targetBounds, screenW, screenH, contextualTarget)
@@ -1658,6 +1811,17 @@ class SkipFlowAccessibilityService : AccessibilityService() {
 
         cornerIconCandidates.forEach { safeRecycle(it.nodeCopy) }
 
+        if (chosenCandidate == null &&
+            allowGooglePlayAdvanceFallback &&
+            isRealAdActivity &&
+            googlePlayAdvanceCandidate != null
+        ) {
+            chosenCandidate = googlePlayAdvanceCandidate
+            googlePlayAdvanceCandidate = null
+        } else {
+            googlePlayAdvanceCandidate?.recycleNode(this)
+        }
+
         val isSponsoredSocialVisible = collectSocialSignals &&
             hasSponsoredSocialLabel &&
             SocialAutoSwipeDetector.isFeedSurfaceConfirmed(
@@ -1704,6 +1868,9 @@ class SkipFlowAccessibilityService : AccessibilityService() {
         screenW: Int,
         screenH: Int
     ): Boolean {
+        if (candidate.isGooglePlayAdvance != currentBest.isGooglePlayAdvance) {
+            return !candidate.isGooglePlayAdvance
+        }
         if (candidate.priority != currentBest.priority) {
             return candidate.priority < currentBest.priority
         }
@@ -1770,6 +1937,206 @@ class SkipFlowAccessibilityService : AccessibilityService() {
             safeRecycle(parent)
         }
         return false
+    }
+
+    private fun hasGooglePlayOnlyInHierarchy(node: AccessibilityNodeInfo): Boolean {
+        var sawGooglePlay = AdDetectionRules.isGooglePlayKeyword(
+            node.viewIdResourceName,
+            node.text,
+            node.contentDescription
+        )
+        if (AdDetectionRules.isNonGooglePlayStoreKeyword(node.viewIdResourceName, node.text, node.contentDescription)) {
+            return false
+        }
+
+        val childCount = node.childCount.coerceAtMost(6)
+        for (i in 0 until childCount) {
+            val child = node.getChild(i) ?: continue
+            try {
+                if (AdDetectionRules.isNonGooglePlayStoreKeyword(child.viewIdResourceName, child.text, child.contentDescription)) {
+                    return false
+                }
+                if (AdDetectionRules.isGooglePlayKeyword(child.viewIdResourceName, child.text, child.contentDescription)) {
+                    sawGooglePlay = true
+                }
+            } finally {
+                safeRecycle(child)
+            }
+        }
+
+        val parent = node.parent
+        if (parent != null) {
+            try {
+                if (AdDetectionRules.isNonGooglePlayStoreKeyword(parent.viewIdResourceName, parent.text, parent.contentDescription)) {
+                    return false
+                }
+                if (AdDetectionRules.isGooglePlayKeyword(parent.viewIdResourceName, parent.text, parent.contentDescription)) {
+                    sawGooglePlay = true
+                }
+                val siblingCount = parent.childCount.coerceAtMost(8)
+                for (i in 0 until siblingCount) {
+                    val sibling = parent.getChild(i) ?: continue
+                    try {
+                        if (AdDetectionRules.isNonGooglePlayStoreKeyword(sibling.viewIdResourceName, sibling.text, sibling.contentDescription)) {
+                            return false
+                        }
+                        if (AdDetectionRules.isGooglePlayKeyword(sibling.viewIdResourceName, sibling.text, sibling.contentDescription)) {
+                            sawGooglePlay = true
+                        }
+                    } finally {
+                        safeRecycle(sibling)
+                    }
+                }
+            } finally {
+                safeRecycle(parent)
+            }
+        }
+        return sawGooglePlay
+    }
+
+    private fun tryHandleStoreRedirectBounceBack(
+        eventPkg: String?,
+        eventClassName: CharSequence?,
+        event: AccessibilityEvent?,
+        bounceBackEnabled: Boolean,
+        nowElapsed: Long
+    ): Boolean {
+        if (!bounceBackEnabled) return false
+
+        val directStoreOrChooser = eventPkg != null &&
+            (eventPkg == AdDetectionRules.PLAY_STORE_PACKAGE ||
+                AdDetectionRules.isAppChooserPackageOrActivity(eventPkg, eventClassName))
+
+        if (pendingBounceBackRunnable != null) {
+            return directStoreOrChooser
+        }
+
+        val targetPkg = when {
+            directStoreOrChooser -> eventPkg!!
+            event != null && hasStorePickerContent(event, eventPkg ?: "") -> eventPkg ?: "android"
+            else -> findVisibleStoreOrChooserWindowPackage() ?: return false
+        }
+
+        // Refresh active-ad window if current activity is still a confirmed Ad Activity right as
+        // an in-app Play Store overlay bottom-sheet or chooser slides on top.
+        val trackedPkg = currentActivityPackage
+        if (trackedPkg != null && isCurrentActivityRealAdScreen(trackedPkg)) {
+            playStoreRedirectGuard.markActiveAdContext(trackedPkg, nowElapsed)
+        }
+
+        val chooserDialogDetected = if (event != null && eventPkg != null) {
+            hasStorePickerContent(event, eventPkg)
+        } else {
+            AdDetectionRules.isAppChooserPackageOrActivity(targetPkg, eventClassName)
+        }
+
+        if (!playStoreRedirectGuard.shouldBounceBack(
+                enteredPackage = targetPkg,
+                bounceBackEnabled = bounceBackEnabled,
+                nowMs = nowElapsed,
+                enteredClassName = eventClassName,
+                hasStoreChooserContent = chooserDialogDetected
+            )
+        ) {
+            return false
+        }
+
+        val redirectedTap = playStoreRedirectGuard.consumeRedirectedTapInfo()
+        if (redirectedTap != null) {
+            repository.recordFakeXTrap(
+                packageName = redirectedTap.packageName,
+                activityName = redirectedTap.activityName,
+                normCenterX = redirectedTap.normCenterX,
+                normCenterY = redirectedTap.normCenterY,
+                viewId = redirectedTap.viewId
+            )
+        }
+
+        val savedAdPkg = currentActivityPackage ?: activeMonitoredPackage
+        val savedAdCls = currentActivityClassName
+        val savedGooglePlayAdvance = hasTappedGooglePlayAdvance
+        preRedirectAdPackage = savedAdPkg
+        preRedirectAdActivityClass = savedAdCls
+        preRedirectHadGooglePlayAdvance = savedGooglePlayAdvance
+
+        stopCountdownPolling()
+        dismissAdCurtainAndRestoreAudio(clearSessionSuppression = false)
+
+        pendingResumeAfterBounceRunnable?.let { mainHandler.removeCallbacks(it) }
+        pendingResumeAfterBounceRunnable = null
+
+        val bounceRunnable = Runnable {
+            pendingBounceBackRunnable = null
+            if (!isEngineActiveAndNotSnoozed() || !powerManager.isInteractive) return@Runnable
+            val currentFront = resolveActiveApplicationPackage(fallbackPackage = null)
+            if (currentFront != null && AdDetectionRules.isLauncherPackage(currentFront)) {
+                playStoreRedirectGuard.clearOnLauncherOrUserExit()
+                return@Runnable
+            }
+
+            performGlobalAction(GLOBAL_ACTION_BACK)
+
+            if (savedAdPkg != null && savedAdPkg != AdDetectionRules.PLAY_STORE_PACKAGE) {
+                currentActivityPackage = savedAdPkg
+                currentActivityClassName = savedAdCls
+                hasTappedGooglePlayAdvance = savedGooglePlayAdvance
+                isAdScreenActive = AdDetectionRules.isRealAdActivity(savedAdCls)
+                activeMonitoredPackage = savedAdPkg
+                _currentActivePackage.value = savedAdPkg
+            }
+            lastScanElapsedMs = 0L
+
+            val resumeRunnable = Runnable {
+                pendingResumeAfterBounceRunnable = null
+                if (isEngineActiveAndNotSnoozed() && activeMonitoredPackage != null) {
+                    ensureCountdownPollingActive()
+                }
+            }
+            pendingResumeAfterBounceRunnable = resumeRunnable
+            mainHandler.postDelayed(resumeRunnable, POST_BOUNCE_RESUME_DELAY_MS)
+        }
+        pendingBounceBackRunnable = bounceRunnable
+        mainHandler.postDelayed(bounceRunnable, BOUNCE_BACK_SETTLE_DELAY_MS)
+
+        emitStatusUpdate(
+            pkg = targetPkg,
+            isAdScreen = false,
+            screenshotStatus = "-",
+            detail = when {
+                redirectedTap != null -> "حظر زر X وهمي (24 ساعة) والرجوع"
+                targetPkg == AdDetectionRules.PLAY_STORE_PACKAGE -> "رجوع تلقائي من المتجر (400ms)"
+                else -> "إغلاق نافذة اختيار المتجر"
+            }
+        )
+        return true
+    }
+
+    private fun findVisibleStoreOrChooserWindowPackage(): String? {
+        var foundPkg: String? = null
+        runCatching {
+            for (window in windows) {
+                val winRoot = window.root ?: continue
+                val winPkg = try {
+                    winRoot.packageName?.toString()
+                } finally {
+                    safeRecycle(winRoot)
+                }
+                if (winPkg == AdDetectionRules.PLAY_STORE_PACKAGE ||
+                    AdDetectionRules.isAppChooserPackageOrActivity(winPkg, null)
+                ) {
+                    foundPkg = winPkg
+                    break
+                }
+            }
+        }
+        return foundPkg
+    }
+
+    private fun cancelPendingBounceBack() {
+        pendingBounceBackRunnable?.let { mainHandler.removeCallbacks(it) }
+        pendingBounceBackRunnable = null
+        pendingResumeAfterBounceRunnable?.let { mainHandler.removeCallbacks(it) }
+        pendingResumeAfterBounceRunnable = null
     }
 
     private fun hasStorePickerContent(event: AccessibilityEvent, eventPkg: String): Boolean {
@@ -2502,6 +2869,8 @@ class SkipFlowAccessibilityService : AccessibilityService() {
         private const val UNCONFIRMED_OCR_COOLDOWN_MS = 1_800L
         private const val SPARSE_TREE_NODE_THRESHOLD = 25
         private const val TOAST_COOLDOWN_MS = 2_400L
+        private const val BOUNCE_BACK_SETTLE_DELAY_MS = 400L
+        private const val POST_BOUNCE_RESUME_DELAY_MS = 350L
 
         private val _isServiceConnected = MutableStateFlow(false)
         val isServiceConnected: StateFlow<Boolean> = _isServiceConnected.asStateFlow()

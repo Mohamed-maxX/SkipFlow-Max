@@ -18,7 +18,10 @@ data class OcrAdScanResult(
     val actionTargetBounds: BoundsRect?,
     val matchedKeyword: String?,
     val hasAdContext: Boolean,
-    val storeExclusionRects: List<BoundsRect> = emptyList()
+    val storeExclusionRects: List<BoundsRect> = emptyList(),
+    val googlePlayRects: List<BoundsRect> = emptyList(),
+    val googlePlayAdvanceBounds: BoundsRect? = null,
+    val googlePlayAdvanceKeyword: String? = null
 )
 
 /**
@@ -95,6 +98,102 @@ object OcrAdTextMatcher {
         return storeRects
     }
 
+    fun findGooglePlayPillRects(observations: List<OcrObservation>): List<BoundsRect> {
+        if (observations.isEmpty()) return emptyList()
+        val playRects = mutableListOf<BoundsRect>()
+        for (obs in observations) {
+            if (obs.confidence in 1f..25f) continue
+            val norm = AdDetectionRules.normalizeText(obs.text, maxLength = 72) ?: continue
+            if (AdDetectionRules.isGooglePlayKeyword(null, norm, null)) {
+                playRects.add(
+                    BoundsRect(
+                        left = obs.bounds.left - 200,
+                        top = obs.bounds.top - 24,
+                        right = obs.bounds.right + 200,
+                        bottom = obs.bounds.bottom + 24
+                    )
+                )
+            }
+        }
+        return playRects
+    }
+
+    /**
+     * Finds a top-corner `"Google Play >>"` or `">| Google Play"` Stage-1 advance pill
+     * (either as one OCR observation or split adjacent `[Google Play] + [>> / >|]` boxes)
+     * inside confirmed Ad Activities when no standard `X` or `Skip` button exists.
+     */
+    fun findGooglePlayAdvanceTarget(
+        observations: List<OcrObservation>,
+        screenWidth: Int,
+        screenHeight: Int,
+        nonStoreExcludedRects: List<BoundsRect> = emptyList()
+    ): Pair<BoundsRect, String>? {
+        if (observations.isEmpty() || screenWidth <= 0 || screenHeight <= 0) return null
+        val maxTopAdvanceY = (screenHeight * 0.34f).toInt()
+        val maxHorizGapPx = (screenWidth * 0.28f).toInt().coerceAtLeast(180)
+
+        val plausibleObs = observations.filter { obs ->
+            obs.confidence !in 1f..25f &&
+                !obs.bounds.isEmpty &&
+                obs.bounds.centerY in 2..maxTopAdvanceY &&
+                isPlausibleButtonBox(obs.bounds, screenWidth, screenHeight) &&
+                !OpenCvTemplateEvaluator.isInsideExcludedRect(
+                    obs.bounds.centerX.toFloat(),
+                    obs.bounds.centerY.toFloat(),
+                    nonStoreExcludedRects
+                )
+        }
+
+        // 1. Direct combined pill observation: e.g. "Google Play >>" or ">| Google Play"
+        for (obs in plausibleObs) {
+            val norm = AdDetectionRules.normalizeText(obs.text, maxLength = 48) ?: continue
+            if (AdDetectionRules.isCountdownText(norm)) continue
+            if (AdDetectionRules.hasExcludedCornerKeyword(null, norm, null)) continue
+            if (AdDetectionRules.isNonGooglePlayStoreKeyword(null, norm, null)) continue
+            if (AdDetectionRules.isGooglePlayAdvancePill(norm, null)) {
+                return obs.bounds to norm
+            }
+        }
+
+        // 2. Split adjacent observations: "Google Play" + nearby ">|" / ">>" / ">" / "|>"
+        val playBoxes = plausibleObs.filter { obs ->
+            val norm = AdDetectionRules.normalizeText(obs.text, maxLength = 48) ?: return@filter false
+            AdDetectionRules.isGooglePlayKeyword(null, norm, null) &&
+                !AdDetectionRules.isNonGooglePlayStoreKeyword(null, norm, null)
+        }
+        if (playBoxes.isEmpty()) return null
+
+        val chevronBoxes = plausibleObs.filter { obs ->
+            val norm = AdDetectionRules.normalizeText(obs.text, maxLength = 20) ?: return@filter false
+            !AdDetectionRules.hasExcludedCornerKeyword(null, norm, null) &&
+                !AdDetectionRules.hasStoreRedirectKeyword(null, norm, null) &&
+                (norm in setOf(">", ">>", "> >", ">|", "|>", "> |", "| >", "»", "›", "»|", "|»") ||
+                    cornerDualGlyphKeywords.any { norm.contains(it, ignoreCase = true) })
+        }
+
+        for (playObs in playBoxes) {
+            for (chevObs in chevronBoxes) {
+                val sameRowTolerance = (maxOf(playObs.bounds.height, chevObs.bounds.height) * 1.5f)
+                    .toInt()
+                    .coerceAtLeast(36)
+                val dy = kotlin.math.abs(playObs.bounds.centerY - chevObs.bounds.centerY)
+                if (dy > sameRowTolerance) continue
+
+                val horizGap = when {
+                    chevObs.bounds.left >= playObs.bounds.right -> chevObs.bounds.left - playObs.bounds.right
+                    playObs.bounds.left >= chevObs.bounds.right -> playObs.bounds.left - chevObs.bounds.right
+                    else -> 0
+                }
+                if (horizGap <= maxHorizGapPx) {
+                    return chevObs.bounds to "Google Play ${chevObs.text.trim()}"
+                }
+            }
+        }
+
+        return null
+    }
+
     fun evaluateObservations(
         observations: List<OcrObservation>,
         screenWidth: Int,
@@ -149,11 +248,20 @@ object OcrAdTextMatcher {
         // Strict verification: never trigger ANY OCR tap unless the screen is a confirmed AdActivity
         // or actively displays explicit ad text.
         val winner = if (hasAdContext) (bestHighPriority ?: bestContextual) else null
+        val playRects = findGooglePlayPillRects(observations)
+        val playAdvance = if (isRealAdActivity && winner == null) {
+            findGooglePlayAdvanceTarget(observations, screenWidth, screenHeight, excludedRects)
+        } else {
+            null
+        }
         return OcrAdScanResult(
             actionTargetBounds = winner?.first?.bounds,
             matchedKeyword = winner?.second,
             hasAdContext = hasAdContext,
-            storeExclusionRects = storeExclusionRects
+            storeExclusionRects = storeExclusionRects,
+            googlePlayRects = playRects,
+            googlePlayAdvanceBounds = playAdvance?.first,
+            googlePlayAdvanceKeyword = playAdvance?.second
         )
     }
 
@@ -168,7 +276,9 @@ object OcrAdTextMatcher {
         }
 
         val storeExclusionRects = findStoreRedirectExclusionRects(observations)
+        val playRects = findGooglePlayPillRects(observations)
         val combinedExcludedRects = excludedRects + storeExclusionRects
+        val playAdvance = findGooglePlayAdvanceTarget(observations, screenWidth, screenHeight, excludedRects)
 
         for (obs in observations) {
             if (obs.confidence in 1f..30f) continue
@@ -187,14 +297,38 @@ object OcrAdTextMatcher {
             }
 
             if (norm == "x") {
-                return OcrAdScanResult(obs.bounds, "X", hasAdContext = true, storeExclusionRects = storeExclusionRects)
+                return OcrAdScanResult(
+                    actionTargetBounds = obs.bounds,
+                    matchedKeyword = "X",
+                    hasAdContext = true,
+                    storeExclusionRects = storeExclusionRects,
+                    googlePlayRects = playRects,
+                    googlePlayAdvanceBounds = playAdvance?.first,
+                    googlePlayAdvanceKeyword = playAdvance?.second
+                )
             }
             val matched = cornerDualGlyphKeywords.firstOrNull { norm.contains(it, ignoreCase = true) }
             if (matched != null) {
-                return OcrAdScanResult(obs.bounds, matched, hasAdContext = true, storeExclusionRects = storeExclusionRects)
+                return OcrAdScanResult(
+                    actionTargetBounds = obs.bounds,
+                    matchedKeyword = matched,
+                    hasAdContext = true,
+                    storeExclusionRects = storeExclusionRects,
+                    googlePlayRects = playRects,
+                    googlePlayAdvanceBounds = playAdvance?.first,
+                    googlePlayAdvanceKeyword = playAdvance?.second
+                )
             }
         }
-        return OcrAdScanResult(null, null, hasAdContext = false, storeExclusionRects = storeExclusionRects)
+        return OcrAdScanResult(
+            actionTargetBounds = null,
+            matchedKeyword = null,
+            hasAdContext = false,
+            storeExclusionRects = storeExclusionRects,
+            googlePlayRects = playRects,
+            googlePlayAdvanceBounds = playAdvance?.first,
+            googlePlayAdvanceKeyword = playAdvance?.second
+        )
     }
 
     private fun isAdContextText(normalized: String): Boolean {
@@ -331,6 +465,9 @@ class TesseractOcrEngine(
             (bmpW - cropW).coerceAtLeast(0) to 0
         )
         val accumulatedStoreRects = mutableListOf<BoundsRect>()
+        val accumulatedGooglePlayRects = mutableListOf<BoundsRect>()
+        var fallbackPlayAdvanceBounds: BoundsRect? = null
+        var fallbackPlayAdvanceKeyword: String? = null
 
         for ((cropX, cropY) in corners) {
             var cropped: Bitmap? = null
@@ -365,8 +502,18 @@ class TesseractOcrEngine(
                     excludedRects = excludedRects + accumulatedStoreRects
                 )
                 accumulatedStoreRects.addAll(result.storeExclusionRects)
+                accumulatedGooglePlayRects.addAll(result.googlePlayRects)
+                if (fallbackPlayAdvanceBounds == null && result.googlePlayAdvanceBounds != null) {
+                    fallbackPlayAdvanceBounds = result.googlePlayAdvanceBounds
+                    fallbackPlayAdvanceKeyword = result.googlePlayAdvanceKeyword
+                }
                 if (result.actionTargetBounds != null) {
-                    return@withLock result.copy(storeExclusionRects = accumulatedStoreRects.toList())
+                    return@withLock result.copy(
+                        storeExclusionRects = accumulatedStoreRects.toList(),
+                        googlePlayRects = accumulatedGooglePlayRects.toList(),
+                        googlePlayAdvanceBounds = fallbackPlayAdvanceBounds,
+                        googlePlayAdvanceKeyword = fallbackPlayAdvanceKeyword
+                    )
                 }
             } catch (_: Throwable) {
                 // Continue to remaining corner
@@ -380,7 +527,10 @@ class TesseractOcrEngine(
             actionTargetBounds = null,
             matchedKeyword = null,
             hasAdContext = false,
-            storeExclusionRects = accumulatedStoreRects.toList()
+            storeExclusionRects = accumulatedStoreRects.toList(),
+            googlePlayRects = accumulatedGooglePlayRects.toList(),
+            googlePlayAdvanceBounds = fallbackPlayAdvanceBounds,
+            googlePlayAdvanceKeyword = fallbackPlayAdvanceKeyword
         )
     }
 

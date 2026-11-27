@@ -295,6 +295,20 @@ object AdDetectionRules {
         "متجر بلاي"
     )
 
+    private val googlePlayStoreKeywords = listOf(
+        "google play",
+        "play store",
+        "متجر play",
+        "متجر بلاي"
+    )
+
+    private val nonGooglePlayStoreKeywords = listOf(
+        "getapps",
+        "get apps",
+        "install",
+        "تثبيت"
+    )
+
     // Android / OEM app chooser & store picker identifiers for Anti-Redirect Bounce-Back.
     private val appChooserKeywords = listOf(
         "resolveractivity",
@@ -603,6 +617,50 @@ object AdDetectionRules {
         val normId = viewIdResourceName?.lowercase()
         return listOfNotNull(normText, normDesc, normId).any { value ->
             storeRedirectKeywords.any { kw -> value.contains(kw) }
+        }
+    }
+
+    fun isGooglePlayKeyword(
+        viewIdResourceName: String?,
+        text: CharSequence?,
+        contentDescription: CharSequence?
+    ): Boolean {
+        val normText = text?.toString()?.lowercase()
+        val normDesc = contentDescription?.toString()?.lowercase()
+        val normId = viewIdResourceName?.lowercase()
+        return listOfNotNull(normText, normDesc, normId).any { value ->
+            googlePlayStoreKeywords.any { kw -> value.contains(kw) }
+        }
+    }
+
+    fun isNonGooglePlayStoreKeyword(
+        viewIdResourceName: String?,
+        text: CharSequence?,
+        contentDescription: CharSequence?
+    ): Boolean {
+        val normText = text?.toString()?.lowercase()
+        val normDesc = contentDescription?.toString()?.lowercase()
+        val normId = viewIdResourceName?.lowercase()
+        return listOfNotNull(normText, normDesc, normId).any { value ->
+            nonGooglePlayStoreKeywords.any { kw -> value.contains(kw) }
+        }
+    }
+
+    fun isGooglePlayAdvancePill(
+        text: CharSequence?,
+        contentDescription: CharSequence?
+    ): Boolean {
+        return listOfNotNull(
+            normalizeText(text, maxLength = 48),
+            normalizeText(contentDescription, maxLength = 48)
+        ).any { value ->
+            val hasPlayName = googlePlayStoreKeywords.any { value.contains(it) }
+            val hasAdvanceGlyph = value.contains(">") ||
+                value.contains("»") ||
+                value.contains("›") ||
+                value.contains("skip") ||
+                value.contains("تخطي")
+            hasPlayName && hasAdvanceGlyph
         }
     }
 

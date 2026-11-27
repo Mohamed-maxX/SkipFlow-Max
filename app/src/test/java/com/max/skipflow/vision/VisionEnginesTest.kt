@@ -242,5 +242,42 @@ class VisionEnginesTest {
             screenHeight = screenH
         )
         assertNull(installSplitPill.actionTargetBounds)
+        assertNull(installSplitPill.googlePlayAdvanceBounds)
+    }
+
+    @Test
+    fun `OcrAdTextMatcher exposes top-corner Google Play advance pill only as fallback target`() {
+        val screenW = 1080
+        val screenH = 2400
+
+        val cornerPlayPill = OcrAdTextMatcher.evaluateCornerObservations(
+            observations = listOf(OcrObservation(">| Google Play", BoundsRect(40, 80, 340, 150), 89f)),
+            screenWidth = screenW,
+            screenHeight = screenH
+        )
+        assertNull(cornerPlayPill.actionTargetBounds)
+        assertEquals(BoundsRect(40, 80, 340, 150), cornerPlayPill.googlePlayAdvanceBounds)
+
+        // Split adjacent "Google Play" + ">>" in top corner -> returns chevron target
+        val splitPlayPill = OcrAdTextMatcher.evaluateCornerObservations(
+            observations = listOf(
+                OcrObservation("Google Play", BoundsRect(700, 90, 920, 150), 90f),
+                OcrObservation(">>", BoundsRect(940, 90, 1030, 150), 88f)
+            ),
+            screenWidth = screenW,
+            screenHeight = screenH
+        )
+        assertNull(splitPlayPill.actionTargetBounds)
+        assertEquals(BoundsRect(940, 90, 1030, 150), splitPlayPill.googlePlayAdvanceBounds)
+
+        // Bottom banner "Google Play >>" must never match Stage-1 corner advance
+        val bottomBanner = OcrAdTextMatcher.evaluateObservations(
+            observations = listOf(OcrObservation("Google Play >>", BoundsRect(200, 2100, 860, 2240), 92f)),
+            screenWidth = screenW,
+            screenHeight = screenH,
+            isRealAdActivity = true
+        )
+        assertNull(bottomBanner.actionTargetBounds)
+        assertNull(bottomBanner.googlePlayAdvanceBounds)
     }
 }
