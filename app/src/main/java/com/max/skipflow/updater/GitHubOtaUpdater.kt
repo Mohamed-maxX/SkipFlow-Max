@@ -52,8 +52,10 @@ class GitHubOtaUpdater(private val context: Context) {
     private val _state = MutableStateFlow<OtaUpdateState>(OtaUpdateState.Idle)
     val state: StateFlow<OtaUpdateState> = _state.asStateFlow()
 
-    suspend fun checkForUpdates() = withContext(Dispatchers.IO) {
-        _state.value = OtaUpdateState.Checking
+    suspend fun checkForUpdates(silent: Boolean = false) = withContext(Dispatchers.IO) {
+        if (!silent) {
+            _state.value = OtaUpdateState.Checking
+        }
         val currentVersion = BuildConfig.VERSION_NAME
 
         try {
@@ -65,20 +67,26 @@ class GitHubOtaUpdater(private val context: Context) {
 
             client.newCall(request).execute().use { response ->
                 if (response.code == 404) {
-                    _state.value = OtaUpdateState.NoReleasesYet(currentVersion)
+                    if (!silent) {
+                        _state.value = OtaUpdateState.NoReleasesYet(currentVersion)
+                    }
                     return@withContext
                 }
                 if (!response.isSuccessful) {
-                    _state.value = OtaUpdateState.Error(
-                        "تعذر الاتصال بـ GitHub (رمز الحالة: ${response.code})"
-                    )
+                    if (!silent) {
+                        _state.value = OtaUpdateState.Error(
+                            "تعذر الاتصال بـ GitHub (رمز الحالة: ${response.code})"
+                        )
+                    }
                     return@withContext
                 }
 
                 val body = response.body?.string().orEmpty()
                 val release = GitHubReleaseParser.parseLatestRelease(body)
                 if (release == null) {
-                    _state.value = OtaUpdateState.NoReleasesYet(currentVersion)
+                    if (!silent) {
+                        _state.value = OtaUpdateState.NoReleasesYet(currentVersion)
+                    }
                     return@withContext
                 }
 
@@ -87,14 +95,16 @@ class GitHubOtaUpdater(private val context: Context) {
                         release = release,
                         currentVersion = currentVersion
                     )
-                } else {
+                } else if (!silent) {
                     _state.value = OtaUpdateState.UpToDate(currentVersion)
                 }
             }
         } catch (e: Exception) {
-            _state.value = OtaUpdateState.Error(
-                "فشل التحقق من التحديثات. تأكد من الاتصال بالإنترنت."
-            )
+            if (!silent) {
+                _state.value = OtaUpdateState.Error(
+                    "فشل التحقق من التحديثات. تأكد من الاتصال بالإنترنت."
+                )
+            }
         }
     }
 

@@ -3,12 +3,16 @@ package com.max.skipflow
 import android.app.Application
 import android.content.Context
 import com.max.skipflow.data.AppCatalogRepository
+import com.max.skipflow.data.RemoteRulesManager
 import com.max.skipflow.data.SkipFlowRepository
+import com.max.skipflow.engine.YouTubeSponsorBlockManager
 import com.max.skipflow.health.HealthCheckManager
+import com.max.skipflow.shizuku.ShizukuTapBridge
 import com.max.skipflow.updater.GitHubOtaUpdater
 import com.max.skipflow.vision.OpenCvAdIconDetector
 import com.max.skipflow.vision.TessDataManager
 import com.max.skipflow.vision.TesseractOcrEngine
+import com.max.skipflow.workers.RulesSyncWorker
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -45,6 +49,18 @@ class AppContainer(context: Context) {
     val tesseractOcrEngine: TesseractOcrEngine by lazy {
         TesseractOcrEngine(tessDataManager)
     }
+
+    val remoteRulesManager: RemoteRulesManager by lazy {
+        RemoteRulesManager(appContext, skipFlowRepository)
+    }
+
+    val youTubeSponsorBlockManager: YouTubeSponsorBlockManager by lazy {
+        YouTubeSponsorBlockManager()
+    }
+
+    val shizukuTapBridge: ShizukuTapBridge by lazy {
+        ShizukuTapBridge(appContext)
+    }
 }
 
 class SkipFlowApplication : Application() {
@@ -61,6 +77,9 @@ class SkipFlowApplication : Application() {
         super.onCreate()
         isOpenCvInitialized = runCatching { OpenCVLoader.initLocal() }.getOrDefault(false)
         container = AppContainer(this)
+        container.remoteRulesManager.loadAndApplyCachedOrBundledRules()
+        container.shizukuTapBridge.registerListeners()
+        RulesSyncWorker.schedulePeriodicSync(this)
         appScope.launch {
             container.tessDataManager.ensureTessDataReady()
         }

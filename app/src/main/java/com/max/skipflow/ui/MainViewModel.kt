@@ -12,11 +12,14 @@ import androidx.lifecycle.viewModelScope
 import com.max.skipflow.SkipFlowApplication
 import com.max.skipflow.data.DailyStats
 import com.max.skipflow.data.InstalledAppInfo
+import com.max.skipflow.data.RemoteRuleCounts
+import com.max.skipflow.data.RemoteRulesSyncResult
 import com.max.skipflow.data.SkipFlowSettings
 import com.max.skipflow.data.SkipLogEntry
 import com.max.skipflow.engine.CallStateMonitor
 import com.max.skipflow.engine.SkipFlowAccessibilityService
 import com.max.skipflow.health.HealthStatus
+import com.max.skipflow.shizuku.ShizukuStatus
 import com.max.skipflow.updater.GitHubReleaseInfo
 import com.max.skipflow.updater.OtaUpdateState
 import kotlinx.coroutines.delay
@@ -49,7 +52,12 @@ data class MainUiState(
     val isLoadingApps: Boolean = true,
     val searchQuery: String = "",
     val appFilterTab: AppFilterTab = AppFilterTab.ALL,
-    val otaUpdateState: OtaUpdateState = OtaUpdateState.Idle
+    val otaUpdateState: OtaUpdateState = OtaUpdateState.Idle,
+    val lastRulesSyncEpochMs: Long = 0L,
+    val remoteRuleCounts: RemoteRuleCounts = RemoteRuleCounts(),
+    val isSyncingRules: Boolean = false,
+    val rulesSyncFeedback: String? = null,
+    val shizukuStatus: ShizukuStatus = ShizukuStatus.NOT_INSTALLED
 ) {
     val enabledAppsCount: Int
         get() = installedApps.count { it.packageName !in disabledPackages }
@@ -78,6 +86,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val appCatalog = container.appCatalogRepository
     private val healthCheckManager = container.healthCheckManager
     private val otaUpdater = container.gitHubOtaUpdater
+    private val remoteRulesManager = container.remoteRulesManager
+    private val shizukuTapBridge = container.shizukuTapBridge
     private val audioManager = application.getSystemService(Context.AUDIO_SERVICE) as AudioManager
 
     private val _healthStatus = MutableStateFlow(healthCheckManager.checkHealth())
@@ -88,6 +98,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val _searchQuery = MutableStateFlow("")
     private val _appFilterTab = MutableStateFlow(AppFilterTab.ALL)
     private val _snoozeRemainingMs = MutableStateFlow(repository.getSnoozeRemainingMs())
+    private val _isSyncingRules = MutableStateFlow(false)
+    private val _rulesSyncFeedback = MutableStateFlow<String?>(null)
 
     private val coreDataState = combine(
         repository.settings,
@@ -108,6 +120,16 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         AppListSlice(apps, loading, query, filter)
     }
 
+    private val remoteAndTurboState = combine(
+        repository.lastRulesSyncEpochMs,
+        remoteRulesManager.ruleCounts,
+        _isSyncingRules,
+        _rulesSyncFeedback,
+        shizukuTapBridge.status
+    ) { lastSync, ruleCounts, syncing, feedback, shizukuStatus ->
+        RemoteAndTurboSlice(lastSync, ruleCounts, syncing, feedback, shizukuStatus)
+    }
+
     private val systemStatusState = combine(
         _healthStatus,
         _canDrawOverlays,
@@ -121,8 +143,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     val uiState: StateFlow<MainUiState> = combine(
         coreDataState,
         appListState,
-        systemStatusState
-    ) { coreSlice, appsSlice, sysSlice ->
+        systemStatusState,
+        remoteAndTurboState
+    ) { coreSlice, appsSlice, sysSlice, remoteSlice ->
         MainUiState(
             settings = coreSlice.settings,
             stats = coreSlice.stats,
@@ -137,7 +160,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             isLoadingApps = appsSlice.loading,
             searchQuery = appsSlice.query,
             appFilterTab = appsSlice.filter,
-            otaUpdateState = sysSlice.ota
+            otaUpdateState = sysSlice.ota,
+            lastRulesSyncEpochMs = remoteSlice.lastSyncEpochMs,
+            remoteRuleCounts = remoteSlice.ruleCounts,
+            isSyncingRules = remoteSlice.isSyncingRules,
+            rulesSyncFeedback = remoteSlice.feedback,
+            shizukuStatus = remoteSlice.shizukuStatus
         )
     }.stateIn(
         scope = viewModelScope,
@@ -149,6 +177,15 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         refreshSystemState()
         loadInstalledApps()
         observeSnoozeCountdown()
+        performDailySilentOtaCheckIfDue()
+    }
+
+    private fun performDailySilentOtaCheckIfDue() {
+        if (!repository.shouldRunDailyOtaCheck()) return
+        repository.recordOtaCheckedNow()
+        viewModelScope.launch {
+            otaUpdater.checkForUpdates(silent = true)
+        }
     }
 
     private fun observeSnoozeCountdown() {
@@ -176,6 +213,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         _healthStatus.value = healthCheckManager.checkHealth()
         _canDrawOverlays.value = Settings.canDrawOverlays(getApplication())
         _isCallInProgress.value = CallStateMonitor.isCallActive(audioManager)
+        shizukuTapBridge.refreshStatus()
     }
 
     fun loadInstalledApps() {
@@ -245,6 +283,40 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         repository.setAnnoyanceKillerEnabled(enabled)
     }
 
+    fun setSponsorBlockEnabled(enabled: Boolean) {
+        repository.setSponsorBlockEnabled(enabled)
+    }
+
+    fun setShizukuTurboModeEnabled(enabled: Boolean) {
+        repository.setShizukuTurboModeEnabled(enabled)
+        if (enabled) {
+            shizukuTapBridge.requestPermissionIfNeeded()
+        } else {
+            shizukuTapBridge.refreshStatus()
+        }
+    }
+
+    fun requestShizukuPermission() {
+        shizukuTapBridge.requestPermissionIfNeeded()
+    }
+
+    fun syncRulesNow() {
+        if (_isSyncingRules.value) return
+        viewModelScope.launch {
+            _isSyncingRules.value = true
+            _rulesSyncFeedback.value = null
+            when (val res = remoteRulesManager.syncFromRemoteNow()) {
+                is RemoteRulesSyncResult.Success -> {
+                    _rulesSyncFeedback.value = "تم تحديث القواعد (v${res.config.version}) بنجاح"
+                }
+                is RemoteRulesSyncResult.Error -> {
+                    _rulesSyncFeedback.value = res.message
+                }
+            }
+            _isSyncingRules.value = false
+        }
+    }
+
     fun clearSkipLogs() {
         repository.clearSkipLogs()
     }
@@ -287,8 +359,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun checkForUpdates() {
+        repository.recordOtaCheckedNow()
         viewModelScope.launch {
-            otaUpdater.checkForUpdates()
+            otaUpdater.checkForUpdates(silent = false)
         }
     }
 
@@ -327,5 +400,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val connected: Boolean,
         val inCall: Boolean,
         val ota: OtaUpdateState
+    )
+
+    private data class RemoteAndTurboSlice(
+        val lastSyncEpochMs: Long,
+        val ruleCounts: RemoteRuleCounts,
+        val isSyncingRules: Boolean,
+        val feedback: String?,
+        val shizukuStatus: ShizukuStatus
     )
 }

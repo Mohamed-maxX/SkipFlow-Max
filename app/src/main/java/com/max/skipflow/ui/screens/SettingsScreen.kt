@@ -21,10 +21,14 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.Undo
 import androidx.compose.material.icons.automirrored.rounded.VolumeOff
 import androidx.compose.material.icons.rounded.AutoAwesome
+import androidx.compose.material.icons.rounded.Bolt
 import androidx.compose.material.icons.rounded.BugReport
 import androidx.compose.material.icons.rounded.Call
 import androidx.compose.material.icons.rounded.CleaningServices
 import androidx.compose.material.icons.rounded.CloudDownload
+import androidx.compose.material.icons.rounded.CloudSync
+import androidx.compose.material.icons.rounded.Code
+import androidx.compose.material.icons.rounded.FastForward
 import androidx.compose.material.icons.rounded.NotificationsActive
 import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material.icons.rounded.SwipeUp
@@ -53,13 +57,17 @@ import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.runtime.remember
 import com.max.skipflow.BuildConfig
+import com.max.skipflow.shizuku.ShizukuStatus
 import com.max.skipflow.ui.MainUiState
 import com.max.skipflow.ui.theme.SkipFlowColors
 import com.max.skipflow.updater.GitHubOtaUpdater
 import com.max.skipflow.updater.GitHubReleaseInfo
 import com.max.skipflow.updater.OtaUpdateState
 import java.io.File
+import java.text.SimpleDateFormat
+import java.util.Date
 import java.util.Locale
 
 @Composable
@@ -74,6 +82,10 @@ fun SettingsScreen(
     onAdCurtainChanged: (Boolean) -> Unit,
     onAutoSwipeSocialAdsChanged: (Boolean) -> Unit,
     onAnnoyanceKillerChanged: (Boolean) -> Unit,
+    onSponsorBlockChanged: (Boolean) -> Unit,
+    onShizukuTurboModeChanged: (Boolean) -> Unit,
+    onRequestShizukuPermission: () -> Unit,
+    onSyncRulesNow: () -> Unit,
     onRequestOverlayPermission: () -> Unit,
     onCheckForUpdates: () -> Unit,
     onDownloadUpdate: (GitHubReleaseInfo) -> Unit,
@@ -161,7 +173,7 @@ fun SettingsScreen(
                 SettingsToggleRow(
                     icon = Icons.AutoMirrored.Rounded.Undo,
                     title = "الرجوع التلقائي من المتجر",
-                    subtitle = "العودة تلقائياً للعبة إذا فُتح متجر Google Play بالخطأ خلال 3 ثوانٍ من محاولة التخطي",
+                    subtitle = "العودة تلقائياً للعبة إذا فُتح متجر Google Play أو اختيار المتجر بالخطأ خلال الإعلان",
                     checked = uiState.settings.bounceBackFromPlayStore,
                     onCheckedChange = onBounceBackFromPlayStoreChanged
                 )
@@ -169,40 +181,19 @@ fun SettingsScreen(
                 HorizontalDivider(color = SkipFlowColors.NavyBorder.copy(alpha = 0.6f))
 
                 SettingsToggleRow(
-                    icon = Icons.Rounded.BugReport,
-                    title = "شريط التشخيص الحي فوق الشاشة",
-                    subtitle = if (uiState.canDrawOverlays) {
-                        "عرض سطر حي أعلى الشاشة لحالة النشاط ولقطة الشاشة والتعرف البصري (بدل Toast)"
-                    } else {
-                        "يتطلب إذن الظهور فوق التطبيقات (SYSTEM_ALERT_WINDOW) لعرض الشريط الحي"
-                    },
-                    checked = uiState.settings.liveDebugOverlayEnabled,
-                    onCheckedChange = onLiveDebugOverlayChanged
+                    icon = Icons.Rounded.FastForward,
+                    title = "تخطي فقرات الرعاية في يوتيوب (SponsorBlock)",
+                    subtitle = "تخطي فقرات الرعاية والترويج الذاتي داخل مقاطع يوتيوب تلقائياً باستخدام هاش مجهول الهوية",
+                    checked = uiState.settings.sponsorBlockEnabled,
+                    onCheckedChange = onSponsorBlockChanged
                 )
-
-                if (uiState.settings.liveDebugOverlayEnabled && !uiState.canDrawOverlays) {
-                    OutlinedButton(
-                        onClick = onRequestOverlayPermission,
-                        modifier = Modifier.fillMaxWidth(),
-                        shape = RoundedCornerShape(12.dp),
-                        border = BorderStroke(1.dp, SkipFlowColors.WarningAmber.copy(alpha = 0.7f)),
-                        contentPadding = PaddingValues(vertical = 8.dp)
-                    ) {
-                        Text(
-                            text = "منح إذن الظهور فوق التطبيقات الآن",
-                            color = SkipFlowColors.WarningAmber,
-                            fontSize = 12.sp,
-                            fontWeight = FontWeight.Bold
-                        )
-                    }
-                }
 
                 HorizontalDivider(color = SkipFlowColors.NavyBorder.copy(alpha = 0.6f))
 
                 SettingsToggleRow(
                     icon = Icons.Rounded.VisibilityOff,
                     title = "الستار الداكن أثناء العدّ التنازلي (Ad Curtain)",
-                    subtitle = "تغطية شاشة الإعلان بغطاء أنيق وكتم صوته مؤقتاً حتى انتهاء العدّ التنازلي مع إمكانية الإغلاق باللمس",
+                    subtitle = "تغطية وسط الإعلان بغطاء أنيق وكتم صوته مؤقتاً دون حجب الزوايا العلوية",
                     checked = uiState.settings.adCurtainEnabled,
                     onCheckedChange = onAdCurtainChanged
                 )
@@ -228,6 +219,25 @@ fun SettingsScreen(
                 )
             }
         }
+
+        RemoteRulesSyncCard(
+            uiState = uiState,
+            onSyncRulesNow = onSyncRulesNow
+        )
+
+        ShizukuTurboCard(
+            enabled = uiState.settings.shizukuTurboModeEnabled,
+            shizukuStatus = uiState.shizukuStatus,
+            onToggleChanged = onShizukuTurboModeChanged,
+            onRequestPermission = onRequestShizukuPermission
+        )
+
+        DeveloperOptionsCard(
+            liveDebugOverlayEnabled = uiState.settings.liveDebugOverlayEnabled,
+            canDrawOverlays = uiState.canDrawOverlays,
+            onLiveDebugOverlayChanged = onLiveDebugOverlayChanged,
+            onRequestOverlayPermission = onRequestOverlayPermission
+        )
 
         EngineCapabilitiesCard()
 
@@ -324,25 +334,242 @@ private fun EngineCapabilitiesCard() {
                     tint = SkipFlowColors.ElectricBlue
                 )
                 Text(
-                    text = "تقنيات الحماية الذكية (الإصدار v2.0)",
+                    text = "تقنيات الحماية الذكية (الإصدار v3.0)",
                     style = MaterialTheme.typography.titleMedium
                 )
             }
             Text(
-                text = "• التعرف الهجين الثلاثي: Accessibility + OpenCV (0.68/0.78) + Tesseract OCR أوفلاين (عربي/إنجليزي) بوضعَي الطولي والعرضي",
+                text = "• محرك القواعد السحابي (`rules.json`): مزامنة تلقائية كل 24 ساعة عبر WorkManager مع إعادة تحميل فورية",
                 style = MaterialTheme.typography.bodyMedium,
                 fontSize = 12.sp
             )
             Text(
-                text = "• التعلم التلقائي لأزرار X الوهمية وحظرها 24 ساعة + الرجوع التلقائي من متجر Play واختيارات التطبيقات",
+                text = "• تكامل YouTube SponsorBlock + وضع التيربو الاختياري عبر Shizuku للألعاب المحمية",
                 style = MaterialTheme.typography.bodyMedium,
                 fontSize = 12.sp
             )
             Text(
-                text = "• ستار الإعلان مع كتم الصوت + التمرير التلقائي لإعلانات Shorts/Reels + الغفوة الذكية وأيقونة الإعدادات السريعة",
+                text = "• OpenCV (Canny + Adaptive) + Tesseract OCR أوفلاين + ستار الإعلان + التعلم الذكي للأزرار الوهمية",
                 style = MaterialTheme.typography.bodyMedium,
                 fontSize = 12.sp
             )
+        }
+    }
+}
+
+@Composable
+private fun RemoteRulesSyncCard(
+    uiState: MainUiState,
+    onSyncRulesNow: () -> Unit
+) {
+    val formatter = remember { SimpleDateFormat("dd/MM/yyyy • HH:mm", Locale.getDefault()) }
+    val lastSyncLabel = if (uiState.lastRulesSyncEpochMs > 0L) {
+        "آخر مزامنة: ${formatter.format(Date(uiState.lastRulesSyncEpochMs))}"
+    } else {
+        "يستخدم حالياً القواعد المدمجة (لم تُجرَ مزامنة سحابية بعد)"
+    }
+    val counts = uiState.remoteRuleCounts
+
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(20.dp),
+        colors = CardDefaults.cardColors(containerColor = SkipFlowColors.DarkNavyCard),
+        border = BorderStroke(1.dp, SkipFlowColors.NavyBorder)
+    ) {
+        Column(
+            modifier = Modifier.padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Icon(
+                    imageVector = Icons.Rounded.CloudSync,
+                    contentDescription = null,
+                    tint = SkipFlowColors.ElectricCyan
+                )
+                Text(
+                    text = "قواعد الكشف السحابية (rules.json)",
+                    style = MaterialTheme.typography.titleMedium
+                )
+            }
+            Text(
+                text = lastSyncLabel,
+                style = MaterialTheme.typography.bodySmall,
+                color = SkipFlowColors.TextSecondary
+            )
+            Text(
+                text = "القواعد النشطة (v${counts.rulesVersion}): ${counts.adActivitiesCount} نشاط إعلان • ${counts.skipTextsCount} عبارة تخطي • ${counts.excludedPackagesCount} استثناء",
+                style = MaterialTheme.typography.bodySmall,
+                color = SkipFlowColors.ElectricCyan
+            )
+            if (!uiState.rulesSyncFeedback.isNullOrBlank()) {
+                Text(
+                    text = uiState.rulesSyncFeedback,
+                    fontSize = 12.sp,
+                    color = if (uiState.rulesSyncFeedback.contains("بنجاح")) {
+                        SkipFlowColors.HealthyGreen
+                    } else {
+                        SkipFlowColors.WarningAmber
+                    }
+                )
+            }
+            if (uiState.isSyncingRules) {
+                LinearProgressIndicator(
+                    modifier = Modifier.fillMaxWidth(),
+                    color = SkipFlowColors.ElectricCyan,
+                    trackColor = SkipFlowColors.ElevatedNavy
+                )
+            } else {
+                OutlinedButton(
+                    onClick = onSyncRulesNow,
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(14.dp),
+                    border = BorderStroke(1.dp, SkipFlowColors.ElectricBlue.copy(alpha = 0.65f))
+                ) {
+                    Icon(
+                        imageVector = Icons.Rounded.Refresh,
+                        contentDescription = null,
+                        tint = SkipFlowColors.ElectricCyan,
+                        modifier = Modifier.size(18.dp)
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text(
+                        text = "تحديث القواعد الآن",
+                        color = SkipFlowColors.ElectricCyan,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ShizukuTurboCard(
+    enabled: Boolean,
+    shizukuStatus: ShizukuStatus,
+    onToggleChanged: (Boolean) -> Unit,
+    onRequestPermission: () -> Unit
+) {
+    val badgeColor = when (shizukuStatus) {
+        ShizukuStatus.READY -> SkipFlowColors.HealthyGreen
+        ShizukuStatus.PERMISSION_REQUIRED -> SkipFlowColors.WarningAmber
+        ShizukuStatus.SERVICE_NOT_RUNNING,
+        ShizukuStatus.NOT_INSTALLED -> SkipFlowColors.TextSecondary
+    }
+
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(20.dp),
+        colors = CardDefaults.cardColors(containerColor = SkipFlowColors.DarkNavyCard),
+        border = BorderStroke(1.dp, SkipFlowColors.NavyBorder)
+    ) {
+        Column(
+            modifier = Modifier.padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            SettingsToggleRow(
+                icon = Icons.Rounded.Bolt,
+                title = "وضع التيربو (Shizuku)",
+                subtitle = "تنفيذ الضغطات عبر شل Shizuku للألعاب المحمية مع رجوع سلس تلقائي لخدمة الوصول عند عدم التوفر",
+                checked = enabled,
+                onCheckedChange = onToggleChanged
+            )
+            Surface(
+                shape = RoundedCornerShape(12.dp),
+                color = SkipFlowColors.ElevatedNavy,
+                border = BorderStroke(1.dp, badgeColor.copy(alpha = 0.45f))
+            ) {
+                Text(
+                    text = "الحالة: ${shizukuStatus.arabicSummary}",
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    color = badgeColor,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 12.dp, vertical = 8.dp)
+                )
+            }
+            if (shizukuStatus == ShizukuStatus.PERMISSION_REQUIRED) {
+                OutlinedButton(
+                    onClick = onRequestPermission,
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(12.dp),
+                    border = BorderStroke(1.dp, SkipFlowColors.WarningAmber.copy(alpha = 0.7f))
+                ) {
+                    Text(
+                        text = "منح صلاحية Shizuku الآن",
+                        color = SkipFlowColors.WarningAmber,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun DeveloperOptionsCard(
+    liveDebugOverlayEnabled: Boolean,
+    canDrawOverlays: Boolean,
+    onLiveDebugOverlayChanged: (Boolean) -> Unit,
+    onRequestOverlayPermission: () -> Unit
+) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(20.dp),
+        colors = CardDefaults.cardColors(containerColor = SkipFlowColors.DarkNavyCard),
+        border = BorderStroke(1.dp, SkipFlowColors.NavyBorder)
+    ) {
+        Column(
+            modifier = Modifier.padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Icon(
+                    imageVector = Icons.Rounded.Code,
+                    contentDescription = null,
+                    tint = SkipFlowColors.TextSecondary
+                )
+                Text(
+                    text = "خيارات المطور",
+                    style = MaterialTheme.typography.titleMedium,
+                    color = SkipFlowColors.TextPrimary
+                )
+            }
+            HorizontalDivider(color = SkipFlowColors.NavyBorder)
+            SettingsToggleRow(
+                icon = Icons.Rounded.BugReport,
+                title = "شريط التشخيص الحي فوق الشاشة",
+                subtitle = if (canDrawOverlays) {
+                    "عرض سطر حي أعلى الشاشة لحالة النشاط ولقطة الشاشة والتعرف البصري (معطّل افتراضياً)"
+                } else {
+                    "يتطلب إذن الظهور فوق التطبيقات (SYSTEM_ALERT_WINDOW) لعرض الشريط الحي"
+                },
+                checked = liveDebugOverlayEnabled,
+                onCheckedChange = onLiveDebugOverlayChanged
+            )
+            if (liveDebugOverlayEnabled && !canDrawOverlays) {
+                OutlinedButton(
+                    onClick = onRequestOverlayPermission,
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(12.dp),
+                    border = BorderStroke(1.dp, SkipFlowColors.WarningAmber.copy(alpha = 0.7f)),
+                    contentPadding = PaddingValues(vertical = 8.dp)
+                ) {
+                    Text(
+                        text = "منح إذن الظهور فوق التطبيقات الآن",
+                        color = SkipFlowColors.WarningAmber,
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+            }
         }
     }
 }

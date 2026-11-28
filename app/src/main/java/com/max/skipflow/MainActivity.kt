@@ -22,13 +22,21 @@ import androidx.compose.material.icons.rounded.Apps
 import androidx.compose.material.icons.rounded.History
 import androidx.compose.material.icons.rounded.Home
 import androidx.compose.material.icons.rounded.Settings
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.NavigationBarItemDefaults
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -53,6 +61,7 @@ import com.max.skipflow.ui.screens.HomeScreen
 import com.max.skipflow.ui.screens.SettingsScreen
 import com.max.skipflow.ui.theme.SkipFlowColors
 import com.max.skipflow.ui.theme.SkipFlowMaxTheme
+import com.max.skipflow.updater.OtaUpdateState
 
 private enum class SkipFlowTab(
     val title: String,
@@ -215,6 +224,10 @@ private fun SkipFlowAppShell(viewModel: MainViewModel) {
                     onAdCurtainChanged = viewModel::setAdCurtainEnabled,
                     onAutoSwipeSocialAdsChanged = viewModel::setAutoSwipeSocialAdsEnabled,
                     onAnnoyanceKillerChanged = viewModel::setAnnoyanceKillerEnabled,
+                    onSponsorBlockChanged = viewModel::setSponsorBlockEnabled,
+                    onShizukuTurboModeChanged = viewModel::setShizukuTurboModeEnabled,
+                    onRequestShizukuPermission = viewModel::requestShizukuPermission,
+                    onSyncRulesNow = viewModel::syncRulesNow,
                     onRequestOverlayPermission = { viewModel.openOverlayPermissionSettings(context) },
                     onCheckForUpdates = viewModel::checkForUpdates,
                     onDownloadUpdate = viewModel::downloadUpdate,
@@ -225,4 +238,126 @@ private fun SkipFlowAppShell(viewModel: MainViewModel) {
             }
         }
     }
+
+    var dismissedUpdateTag by rememberSaveable { mutableStateOf<String?>(null) }
+    val otaState = uiState.otaUpdateState
+    val activeDialogTag = when (otaState) {
+        is OtaUpdateState.UpdateAvailable -> otaState.release.tagName
+        is OtaUpdateState.Downloading -> "downloading"
+        is OtaUpdateState.ReadyToInstall -> otaState.release.tagName
+        else -> null
+    }
+    if (activeDialogTag != null && activeDialogTag != dismissedUpdateTag && otaState !is OtaUpdateState.Idle) {
+        val showDialog = when (otaState) {
+            is OtaUpdateState.UpdateAvailable -> otaState.release.tagName != dismissedUpdateTag
+            is OtaUpdateState.Downloading -> dismissedUpdateTag != "downloading"
+            is OtaUpdateState.ReadyToInstall -> otaState.release.tagName != dismissedUpdateTag
+            else -> false
+        }
+        if (showDialog) {
+            OtaUpdateDialog(
+                otaState = otaState,
+                onDismiss = {
+                    dismissedUpdateTag = activeDialogTag
+                },
+                onDownload = viewModel::downloadUpdate,
+                onInstall = { file -> viewModel.installDownloadedApk(context, file) },
+                onOpenReleasePage = { url -> viewModel.openReleasePage(context, url) }
+            )
+        }
+    }
+}
+
+@Composable
+private fun OtaUpdateDialog(
+    otaState: OtaUpdateState,
+    onDismiss: () -> Unit,
+    onDownload: (com.max.skipflow.updater.GitHubReleaseInfo) -> Unit,
+    onInstall: (java.io.File) -> Unit,
+    onOpenReleasePage: (String) -> Unit
+) {
+    val titleText = when (otaState) {
+        is OtaUpdateState.UpdateAvailable -> "تحديث جديد متاح (${otaState.release.tagName})"
+        is OtaUpdateState.Downloading -> "جاري تحميل التحديث..."
+        is OtaUpdateState.ReadyToInstall -> "التحديث جاهز للتثبيت (${otaState.release.tagName})"
+        else -> "تحديث SkipFlow Max"
+    }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = SkipFlowColors.DarkNavyCard,
+        titleContentColor = SkipFlowColors.TextPrimary,
+        textContentColor = SkipFlowColors.TextSecondary,
+        title = {
+            Text(text = titleText, fontWeight = FontWeight.Bold)
+        },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                when (otaState) {
+                    is OtaUpdateState.UpdateAvailable -> {
+                        Text(
+                            text = otaState.release.notes.ifBlank {
+                                "يتوفر إصدار أحدث من SkipFlow Max مع تحسينات في الأداء والتخطي."
+                            },
+                            fontSize = 13.sp,
+                            color = SkipFlowColors.TextSecondary
+                        )
+                    }
+                    is OtaUpdateState.Downloading -> {
+                        Text(
+                            text = "نسبة التحميل: ${otaState.progressPercent}%",
+                            color = SkipFlowColors.ElectricCyan
+                        )
+                        LinearProgressIndicator(
+                            progress = { otaState.progressPercent / 100f },
+                            modifier = Modifier.fillMaxWidth(),
+                            color = SkipFlowColors.ElectricCyan,
+                            trackColor = SkipFlowColors.ElevatedNavy
+                        )
+                    }
+                    is OtaUpdateState.ReadyToInstall -> {
+                        Text(
+                            text = "اكتمل تنزيل الحزمة بنجاح. اضغط تثبيت التحديث الآن للمتابعة.",
+                            color = SkipFlowColors.HealthyGreen
+                        )
+                    }
+                    else -> Unit
+                }
+            }
+        },
+        confirmButton = {
+            when (otaState) {
+                is OtaUpdateState.UpdateAvailable -> {
+                    Button(
+                        onClick = {
+                            if (otaState.release.apkDownloadUrl != null) {
+                                onDownload(otaState.release)
+                            } else {
+                                onOpenReleasePage(otaState.release.htmlUrl)
+                            }
+                        },
+                        colors = ButtonDefaults.buttonColors(containerColor = SkipFlowColors.ElectricBlue)
+                    ) {
+                        Text(
+                            text = if (otaState.release.apkDownloadUrl != null) "تحميل التحديث" else "فتح صفحة التحميل"
+                        )
+                    }
+                }
+                is OtaUpdateState.ReadyToInstall -> {
+                    Button(
+                        onClick = { onInstall(otaState.apkFile) },
+                        colors = ButtonDefaults.buttonColors(containerColor = SkipFlowColors.HealthyGreen)
+                    ) {
+                        Text("تثبيت الآن", color = SkipFlowColors.ObsidianBlack, fontWeight = FontWeight.Bold)
+                    }
+                }
+                else -> Unit
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text("لاحقاً", color = SkipFlowColors.TextSecondary)
+            }
+        }
+    )
 }

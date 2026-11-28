@@ -7,10 +7,12 @@ data class SkipFlowSettings(
     val toastOnSkip: Boolean = true,
     val pauseDuringCalls: Boolean = true,
     val bounceBackFromPlayStore: Boolean = true,
-    val liveDebugOverlayEnabled: Boolean = true,
+    val liveDebugOverlayEnabled: Boolean = false,
     val adCurtainEnabled: Boolean = false,
     val autoSwipeSocialAdsEnabled: Boolean = true,
-    val annoyanceKillerEnabled: Boolean = false
+    val annoyanceKillerEnabled: Boolean = false,
+    val sponsorBlockEnabled: Boolean = true,
+    val shizukuTurboModeEnabled: Boolean = false
 )
 
 data class DailyStats(
@@ -31,7 +33,9 @@ enum class SkipDetectionMethod(val arabicLabel: String) {
     OPENCV("OpenCV"),
     OCR("Tesseract OCR"),
     AUTO_SWIPE("التمرير التلقائي"),
-    ANNOYANCE_KILLER("نوافذ مزعجة")
+    ANNOYANCE_KILLER("نوافذ مزعجة"),
+    SPONSOR_BLOCK("SponsorBlock"),
+    SHIZUKU("Shizuku التيربو")
 }
 
 data class SkipLogEntry(

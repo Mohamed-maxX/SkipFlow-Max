@@ -1,5 +1,7 @@
 package com.max.skipflow.engine
 
+import com.max.skipflow.data.RemoteRulesConfig
+
 /**
  * Dual-recognition rules (explicit View IDs + text/contentDescription matching +
  * AdActivity-restricted smart corner detector) for YouTube and mobile game ad networks.
@@ -339,7 +341,7 @@ object AdDetectionRules {
 
     fun isStrictlyExcludedPackage(packageName: String): Boolean {
         val lower = packageName.lowercase()
-        if (lower in strictExcludedPackages) return true
+        if (lower in strictExcludedPackages || lower in remoteExcludedPackages) return true
         if (isLauncherPackage(lower)) return true
         if (lower.contains("screenrecorder")) return true
         return lower.startsWith("com.android.internal") ||
@@ -387,7 +389,8 @@ object AdDetectionRules {
         if (className.isNullOrBlank()) return false
         val lower = className.toString().lowercase()
         if (lower.contains("unityplayer")) return false
-        return AD_ACTIVITY_KEYWORDS.any { keyword -> lower.contains(keyword) }
+        return AD_ACTIVITY_KEYWORDS.any { keyword -> lower.contains(keyword) } ||
+            remoteAdActivityKeywords.any { keyword -> lower.contains(keyword) }
     }
 
     fun isExplicitAdSdkViewId(viewIdResourceName: String?): Boolean {
@@ -733,14 +736,49 @@ object AdDetectionRules {
         return positiveCornerIconKeywords.any { combined.contains(it) }
     }
 
+    @Volatile
+    private var remoteAdActivityKeywords: Set<String> = emptySet()
+
+    @Volatile
+    private var remoteSkipKeywords: Set<String> = emptySet()
+
+    @Volatile
+    private var remoteExcludedPackages: Set<String> = emptySet()
+
+    fun applyRemoteRules(config: RemoteRulesConfig) {
+        remoteAdActivityKeywords = config.adActivities
+            .mapNotNull { it.trim().lowercase().takeIf { k -> k.isNotEmpty() && !k.contains("unityplayer") } }
+            .toSet()
+
+        remoteSkipKeywords = config.skipTexts
+            .mapNotNull { normalizeText(it, maxLength = 48) }
+            .toSet()
+
+        remoteExcludedPackages = config.excludedPackages
+            .mapNotNull { pkg ->
+                pkg.trim().lowercase().takeIf { k ->
+                    k.isNotEmpty() && k != YOUTUBE_PACKAGE
+                }
+            }
+            .toSet()
+    }
+
+    fun resetRemoteRulesToBaseline() {
+        remoteAdActivityKeywords = emptySet()
+        remoteSkipKeywords = emptySet()
+        remoteExcludedPackages = emptySet()
+    }
+
     private fun matchesSkipContains(normalized: String?): Boolean {
         if (normalized == null) return false
-        return skipContainsKeywords.any { keyword -> normalized.contains(keyword, ignoreCase = true) }
+        return skipContainsKeywords.any { keyword -> normalized.contains(keyword, ignoreCase = true) } ||
+            remoteSkipKeywords.any { keyword -> normalized.contains(keyword, ignoreCase = true) }
     }
 
     private fun matchesExplicitAdOnlyPhrase(normalized: String?): Boolean {
         if (normalized == null) return false
-        return explicitAdOnlySkipOrCloseKeywords.any { keyword -> normalized.contains(keyword, ignoreCase = true) }
+        return explicitAdOnlySkipOrCloseKeywords.any { keyword -> normalized.contains(keyword, ignoreCase = true) } ||
+            remoteSkipKeywords.any { keyword -> normalized.contains(keyword, ignoreCase = true) }
     }
 
     private fun matchesGameCloseContains(normalized: String?): Boolean {

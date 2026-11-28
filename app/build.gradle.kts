@@ -13,8 +13,8 @@ android {
         applicationId = "com.max.skipflow"
         minSdk = 26
         targetSdk = 34
-        versionCode = 14
-        versionName = "2.0.2"
+        versionCode = 15
+        versionName = "3.0.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {
@@ -44,6 +44,7 @@ android {
     buildFeatures {
         compose = true
         buildConfig = true
+        aidl = true
     }
 
     androidResources {
@@ -70,6 +71,9 @@ dependencies {
     implementation(libs.androidx.material.icons.extended)
     implementation(libs.kotlinx.coroutines.android)
     implementation(libs.okhttp)
+    implementation(libs.androidx.work.runtime.ktx)
+    implementation(libs.shizuku.api)
+    implementation(libs.shizuku.provider)
     implementation(libs.opencv)
     implementation(libs.tesseract4android)
 

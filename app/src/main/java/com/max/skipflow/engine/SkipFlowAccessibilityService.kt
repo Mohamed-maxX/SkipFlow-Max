@@ -31,6 +31,7 @@ import androidx.annotation.RequiresApi
 import com.max.skipflow.SkipFlowApplication
 import com.max.skipflow.data.SkipDetectionMethod
 import com.max.skipflow.data.SkipFlowRepository
+import com.max.skipflow.shizuku.ShizukuTapBridge
 import com.max.skipflow.vision.DetectedIconShape
 import com.max.skipflow.vision.OpenCvAdIconDetector
 import com.max.skipflow.vision.OpenCvTemplateEvaluator
@@ -65,6 +66,8 @@ class SkipFlowAccessibilityService : AccessibilityService() {
     private lateinit var tesseractOcrEngine: TesseractOcrEngine
     private lateinit var debugOverlayManager: DebugOverlayManager
     private lateinit var adCurtainOverlayManager: AdCurtainOverlayManager
+    private lateinit var youTubeSponsorBlockManager: YouTubeSponsorBlockManager
+    private lateinit var shizukuTapBridge: ShizukuTapBridge
 
     private val mainHandler = Handler(Looper.getMainLooper())
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
@@ -129,6 +132,8 @@ class SkipFlowAccessibilityService : AccessibilityService() {
         tesseractOcrEngine = container.tesseractOcrEngine
         debugOverlayManager = DebugOverlayManager(this)
         adCurtainOverlayManager = AdCurtainOverlayManager(this)
+        youTubeSponsorBlockManager = container.youTubeSponsorBlockManager
+        shizukuTapBridge = container.shizukuTapBridge
         audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
         powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
         volumeController = YouTubeVolumeController(AndroidMediaVolumeBackend(audioManager))
@@ -147,8 +152,19 @@ class SkipFlowAccessibilityService : AccessibilityService() {
                     if (!settings.engineEnabled || repository.isSnoozed()) {
                         volumeController.forceRestore()
                     }
+                    if (settings.shizukuTurboModeEnabled) {
+                        shizukuTapBridge.refreshStatus()
+                    }
                     ServiceNotificationManager.syncNotification(this@SkipFlowAccessibilityService, isRunning)
                     SkipFlowTileService.requestTileRefresh(this@SkipFlowAccessibilityService)
+                }
+            }
+            launch {
+                repository.lastRulesSyncEpochMs.collect { syncedAt ->
+                    if (syncedAt > 0L) {
+                        visionGenerationId.incrementAndGet()
+                        lastDebugDetail = "تم تحديث القواعد"
+                    }
                 }
             }
             launch {
@@ -665,6 +681,13 @@ class SkipFlowAccessibilityService : AccessibilityService() {
         var hasRealWebView = false
         var hasCountdownTreeNode = false
         var hasSponsoredSocialFeed = false
+        var ytVideoId: String? = null
+        var ytTitle: String? = null
+        var ytChannel: String? = null
+        var ytPlaybackSec: Double? = null
+        var ytIsPaused = false
+        var ytPlayerBounds: BoundsRect? = null
+        var ytShortsVisible = false
         var totalVisitedNodes = 0
         var bestCandidate: CandidateMatch? = null
         var annoyanceMatch: AnnoyanceMatch? = null
@@ -714,6 +737,27 @@ class SkipFlowAccessibilityService : AccessibilityService() {
                 }
                 if (result.isSponsoredSocialFeedVisible) {
                     hasSponsoredSocialFeed = true
+                }
+                if (result.ytIsShortsVisible) {
+                    ytShortsVisible = true
+                }
+                if (ytVideoId == null && result.ytVideoId != null) {
+                    ytVideoId = result.ytVideoId
+                }
+                if (ytTitle == null && result.ytTitle != null) {
+                    ytTitle = result.ytTitle
+                }
+                if (ytChannel == null && result.ytChannel != null) {
+                    ytChannel = result.ytChannel
+                }
+                if (ytPlaybackSec == null && result.ytPlaybackSec != null) {
+                    ytPlaybackSec = result.ytPlaybackSec
+                }
+                if (result.ytIsPaused) {
+                    ytIsPaused = true
+                }
+                if (ytPlayerBounds == null && result.ytPlayerBounds != null) {
+                    ytPlayerBounds = result.ytPlayerBounds
                 }
                 if (annoyanceMatch == null && result.annoyanceMatch != null) {
                     annoyanceMatch = result.annoyanceMatch
@@ -857,6 +901,38 @@ class SkipFlowAccessibilityService : AccessibilityService() {
             ) {
                 performSocialAutoSwipe(monitoredPackage, screenW, screenH, nowElapsed)
                 return
+            }
+
+            // YouTube SponsorBlock Integration (fails silently offline or if unavailable, never disrupts ad skipping)
+            if (monitoredPackage == AdDetectionRules.YOUTUBE_PACKAGE) {
+                if (hasYouTubeAd) {
+                    youTubeSponsorBlockManager.onLeftYouTubeOrAdStarted()
+                } else if (currentSettings.sponsorBlockEnabled && !ytShortsVisible) {
+                    youTubeSponsorBlockManager.updatePlaybackState(
+                        directVideoId = ytVideoId,
+                        videoTitle = ytTitle,
+                        channelName = ytChannel,
+                        observedPlaybackSec = ytPlaybackSec,
+                        isPaused = ytIsPaused,
+                        nowElapsedMs = nowElapsed
+                    )
+                    if (youTubeSponsorBlockManager.needsNetworkLookup()) {
+                        serviceScope.launch {
+                            youTubeSponsorBlockManager.fetchMissingSegmentsIfNeeded()
+                        }
+                    }
+                    val sponsorAction = youTubeSponsorBlockManager.evaluateSkipCandidate(nowElapsed)
+                    if (sponsorAction != null) {
+                        performSponsorBlockSkip(
+                            action = sponsorAction,
+                            playerBounds = ytPlayerBounds,
+                            screenW = screenW,
+                            screenH = screenH,
+                            nowElapsed = nowElapsed
+                        )
+                        return
+                    }
+                }
             }
 
             // Annoyance Killer (Rate Us dialogs in normal non-ad screens)
@@ -1476,7 +1552,14 @@ class SkipFlowAccessibilityService : AccessibilityService() {
         val isSponsoredSocialFeedVisible: Boolean,
         val annoyanceMatch: AnnoyanceMatch?,
         val visitedNodes: Int,
-        val excludedRects: List<BoundsRect>
+        val excludedRects: List<BoundsRect>,
+        val ytVideoId: String? = null,
+        val ytTitle: String? = null,
+        val ytChannel: String? = null,
+        val ytPlaybackSec: Double? = null,
+        val ytIsPaused: Boolean = false,
+        val ytPlayerBounds: BoundsRect? = null,
+        val ytIsShortsVisible: Boolean = false
     )
 
     private fun scanWindowTree(
@@ -1507,6 +1590,13 @@ class SkipFlowAccessibilityService : AccessibilityService() {
         var explicitBestCandidate: CandidateMatch? = null
         var contextGatedBestCandidate: CandidateMatch? = null
         var googlePlayAdvanceCandidate: CandidateMatch? = null
+        var ytVideoId: String? = null
+        var ytTitle: String? = null
+        var ytChannel: String? = null
+        var ytPlaybackSec: Double? = null
+        var ytIsPaused = false
+        var ytPlayerBounds: BoundsRect? = null
+        var ytIsShortsVisible = false
         val cornerIconCandidates = mutableListOf<CornerIconCandidate>()
         val excludedRects = mutableListOf<BoundsRect>()
         val tempRect = Rect()
@@ -1532,9 +1622,51 @@ class SkipFlowAccessibilityService : AccessibilityService() {
                 }
                 val visible = node.isVisibleToUser || isWebViewNode
 
-                if (isYouTube && !hasYouTubeAd && visible) {
-                    if (AdDetectionRules.isYouTubeAdIndicator(viewId, text, desc)) {
+                if (isYouTube && visible) {
+                    if (!hasYouTubeAd && AdDetectionRules.isYouTubeAdIndicator(viewId, text, desc)) {
                         hasYouTubeAd = true
+                    }
+                    val suffix = AdDetectionRules.extractViewIdSuffix(viewId)
+                    if (!ytIsShortsVisible && suffix != null &&
+                        (suffix.contains("reel_player") || suffix.contains("reel_watch") || suffix.contains("reel_recycler"))
+                    ) {
+                        ytIsShortsVisible = true
+                    }
+                    if (ytVideoId == null) {
+                        ytVideoId = SponsorBlockParser.extractVideoIdFromText(text)
+                            ?: SponsorBlockParser.extractVideoIdFromText(desc)
+                    }
+                    if (ytPlayerBounds == null && suffix != null &&
+                        (suffix == "player_view" || suffix == "watch_player" || suffix == "player_fragment_container")
+                    ) {
+                        node.getBoundsInScreen(tempRect)
+                        val pb = BoundsRect(tempRect.left, tempRect.top, tempRect.right, tempRect.bottom)
+                        if (!pb.isEmpty) ytPlayerBounds = pb
+                    }
+                    if (ytTitle == null && suffix != null &&
+                        (suffix == "title" || suffix == "watch_metadata_title" || suffix == "video_title")
+                    ) {
+                        val candidateTitle = text?.toString()?.trim()?.takeIf { it.length in 3..180 }
+                        if (candidateTitle != null) ytTitle = candidateTitle
+                    }
+                    if (ytChannel == null && suffix != null &&
+                        (suffix == "owner_name" || suffix == "channel_name" || suffix == "channel_title")
+                    ) {
+                        val candidateChannel = text?.toString()?.trim()?.takeIf { it.length in 2..80 }
+                        if (candidateChannel != null) ytChannel = candidateChannel
+                    }
+                    if (ytPlaybackSec == null &&
+                        ((suffix != null && (suffix.contains("time_bar") || suffix.contains("current_time") || suffix.contains("seek_bar"))) ||
+                            clsName?.contains("SeekBar", ignoreCase = true) == true)
+                    ) {
+                        ytPlaybackSec = SponsorBlockParser.parseTimestampToSeconds(text)
+                            ?: SponsorBlockParser.parseTimestampToSeconds(desc)
+                    }
+                    if (!ytIsPaused && suffix != null && suffix.contains("play_pause")) {
+                        val playPauseLabel = desc?.toString()?.trim()?.lowercase().orEmpty()
+                        if (playPauseLabel == "play" || playPauseLabel == "تشغيل") {
+                            ytIsPaused = true
+                        }
                     }
                 }
 
@@ -1876,7 +2008,14 @@ class SkipFlowAccessibilityService : AccessibilityService() {
             isSponsoredSocialFeedVisible = isSponsoredSocialVisible,
             annoyanceMatch = resolvedAnnoyanceMatch,
             visitedNodes = visitedNodes,
-            excludedRects = excludedRects
+            excludedRects = excludedRects,
+            ytVideoId = ytVideoId,
+            ytTitle = ytTitle,
+            ytChannel = ytChannel,
+            ytPlaybackSec = ytPlaybackSec,
+            ytIsPaused = ytIsPaused,
+            ytPlayerBounds = ytPlayerBounds,
+            ytIsShortsVisible = ytIsShortsVisible
         )
     }
 
@@ -2402,11 +2541,23 @@ class SkipFlowAccessibilityService : AccessibilityService() {
 
         adCurtainOverlayManager.hideAndRunAfterFrameClear {
             if (!isEngineActiveAndNotSnoozed() || !powerManager.isInteractive) return@hideAndRunAfterFrameClear
-            dispatchGesture(
-                gesture,
-                object : GestureResultCallback() {
-                    override fun onCompleted(gestureDescription: GestureDescription?) {
+            if (repository.settings.value.shizukuTurboModeEnabled) {
+                serviceScope.launch {
+                    val tappedByShizuku = withContext(Dispatchers.IO) {
+                        shizukuTapBridge.tryTap(tapX.toInt(), tapY.toInt())
+                    }
+                    if (tappedByShizuku) {
                         onSkipGestureSucceeded(
+                            packageName = packageName,
+                            targetType = targetType,
+                            stageNumber = stageNumber,
+                            countAsNewAdSkip = countAsNewAdSkip,
+                            detectionMethod = SkipDetectionMethod.SHIZUKU,
+                            detectionDetail = "$detectionDetail (Shizuku)"
+                        )
+                    } else {
+                        dispatchAccessibilityGestureTap(
+                            gesture = gesture,
                             packageName = packageName,
                             targetType = targetType,
                             stageNumber = stageNumber,
@@ -2415,10 +2566,99 @@ class SkipFlowAccessibilityService : AccessibilityService() {
                             detectionDetail = detectionDetail
                         )
                     }
-                },
-                mainHandler
+                }
+                return@hideAndRunAfterFrameClear
+            }
+            dispatchAccessibilityGestureTap(
+                gesture = gesture,
+                packageName = packageName,
+                targetType = targetType,
+                stageNumber = stageNumber,
+                countAsNewAdSkip = countAsNewAdSkip,
+                detectionMethod = detectionMethod,
+                detectionDetail = detectionDetail
             )
         }
+    }
+
+    private fun dispatchAccessibilityGestureTap(
+        gesture: GestureDescription,
+        packageName: String,
+        targetType: AdTargetType,
+        stageNumber: Int,
+        countAsNewAdSkip: Boolean,
+        detectionMethod: SkipDetectionMethod,
+        detectionDetail: String
+    ) {
+        dispatchGesture(
+            gesture,
+            object : GestureResultCallback() {
+                override fun onCompleted(gestureDescription: GestureDescription?) {
+                    onSkipGestureSucceeded(
+                        packageName = packageName,
+                        targetType = targetType,
+                        stageNumber = stageNumber,
+                        countAsNewAdSkip = countAsNewAdSkip,
+                        detectionMethod = detectionMethod,
+                        detectionDetail = detectionDetail
+                    )
+                }
+            },
+            mainHandler
+        )
+    }
+
+    private fun performSponsorBlockSkip(
+        action: SponsorSkipAction,
+        playerBounds: BoundsRect?,
+        screenW: Int,
+        screenH: Int,
+        nowElapsed: Long
+    ) {
+        youTubeSponsorBlockManager.markSegmentSkipped(action, nowElapsed)
+        val rawTapX = if (playerBounds != null && !playerBounds.isEmpty) {
+            playerBounds.left + playerBounds.width * 0.80f
+        } else {
+            screenW * 0.80f
+        }
+        val rawTapY = if (playerBounds != null && !playerBounds.isEmpty) {
+            playerBounds.centerY.toFloat()
+        } else {
+            screenH * (if (screenW > screenH) 0.50f else 0.24f)
+        }
+        val (tapX, tapY) = DisplayGeometry.clampTapPoint(rawTapX, rawTapY, screenW, screenH)
+        val tapCount = SponsorBlockParser.doubleTapSeriesCountForJump(action.jumpSeconds)
+
+        val builder = GestureDescription.Builder()
+        for (i in 0 until tapCount) {
+            val jitter = ((i % 3) - 1) * 3f
+            val path = Path().apply { moveTo(tapX + jitter, tapY + jitter) }
+            builder.addStroke(GestureDescription.StrokeDescription(path, i * 75L, 35L))
+        }
+
+        dispatchGesture(
+            builder.build(),
+            object : GestureResultCallback() {
+                override fun onCompleted(gestureDescription: GestureDescription?) {
+                    repository.recordAdSkipped(action.jumpSeconds.toLong().coerceAtLeast(1L))
+                    repository.recordSkipLog(
+                        packageName = AdDetectionRules.YOUTUBE_PACKAGE,
+                        appName = resolveAppName(AdDetectionRules.YOUTUBE_PACKAGE),
+                        method = SkipDetectionMethod.SPONSOR_BLOCK,
+                        detail = "تخطي ${action.category} (${action.jumpSeconds.toInt()}ث)"
+                    )
+                    if (repository.settings.value.vibrateOnSkip) {
+                        performSubtleVibration()
+                    }
+                    Toast.makeText(
+                        applicationContext,
+                        "تم تخطي فقرة إعلانية • SkipFlow",
+                        Toast.LENGTH_SHORT
+                    ).show()
+                }
+            },
+            mainHandler
+        )
     }
 
     private fun onSkipGestureSucceeded(

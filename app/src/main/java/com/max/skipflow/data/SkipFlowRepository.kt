@@ -94,6 +94,12 @@ class SkipFlowRepository(
     private val _skipLogs = MutableStateFlow(loadInitialSkipLogs())
     val skipLogs: StateFlow<List<SkipLogEntry>> = _skipLogs.asStateFlow()
 
+    private val _lastRulesSyncEpochMs = MutableStateFlow(storage.getLong(KEY_LAST_RULES_SYNC_MS, 0L))
+    val lastRulesSyncEpochMs: StateFlow<Long> = _lastRulesSyncEpochMs.asStateFlow()
+
+    private val _lastOtaCheckEpochMs = MutableStateFlow(storage.getLong(KEY_LAST_OTA_CHECK_MS, 0L))
+    val lastOtaCheckEpochMs: StateFlow<Long> = _lastOtaCheckEpochMs.asStateFlow()
+
     private var fakeXTraps: MutableList<FakeXTrapRecord> = loadInitialFakeXTraps().toMutableList()
 
     private fun loadInitialSettings(): SkipFlowSettings {
@@ -104,10 +110,12 @@ class SkipFlowRepository(
             toastOnSkip = storage.getBoolean(KEY_TOAST_ON_SKIP, true),
             pauseDuringCalls = storage.getBoolean(KEY_PAUSE_DURING_CALLS, true),
             bounceBackFromPlayStore = storage.getBoolean(KEY_BOUNCE_BACK_PLAY_STORE, true),
-            liveDebugOverlayEnabled = storage.getBoolean(KEY_LIVE_DEBUG_OVERLAY, true),
+            liveDebugOverlayEnabled = storage.getBoolean(KEY_LIVE_DEBUG_OVERLAY, false),
             adCurtainEnabled = storage.getBoolean(KEY_AD_CURTAIN_ENABLED, false),
             autoSwipeSocialAdsEnabled = storage.getBoolean(KEY_AUTO_SWIPE_SOCIAL_ADS, true),
-            annoyanceKillerEnabled = storage.getBoolean(KEY_ANNOYANCE_KILLER_ENABLED, false)
+            annoyanceKillerEnabled = storage.getBoolean(KEY_ANNOYANCE_KILLER_ENABLED, false),
+            sponsorBlockEnabled = storage.getBoolean(KEY_SPONSOR_BLOCK_ENABLED, true),
+            shizukuTurboModeEnabled = storage.getBoolean(KEY_SHIZUKU_TURBO_MODE, false)
         )
     }
 
@@ -274,6 +282,40 @@ class SkipFlowRepository(
         synchronized(lock) {
             storage.putBoolean(KEY_ANNOYANCE_KILLER_ENABLED, enabled)
             _settings.value = _settings.value.copy(annoyanceKillerEnabled = enabled)
+        }
+    }
+
+    fun setSponsorBlockEnabled(enabled: Boolean) {
+        synchronized(lock) {
+            storage.putBoolean(KEY_SPONSOR_BLOCK_ENABLED, enabled)
+            _settings.value = _settings.value.copy(sponsorBlockEnabled = enabled)
+        }
+    }
+
+    fun setShizukuTurboModeEnabled(enabled: Boolean) {
+        synchronized(lock) {
+            storage.putBoolean(KEY_SHIZUKU_TURBO_MODE, enabled)
+            _settings.value = _settings.value.copy(shizukuTurboModeEnabled = enabled)
+        }
+    }
+
+    fun recordRulesSynced(nowMs: Long = clockProvider()) {
+        synchronized(lock) {
+            storage.putLong(KEY_LAST_RULES_SYNC_MS, nowMs)
+            _lastRulesSyncEpochMs.value = nowMs
+        }
+    }
+
+    fun shouldRunDailyOtaCheck(nowMs: Long = clockProvider()): Boolean {
+        val last = _lastOtaCheckEpochMs.value
+        if (last <= 0L) return true
+        return (nowMs - last) >= OTA_DAILY_CHECK_INTERVAL_MS
+    }
+
+    fun recordOtaCheckedNow(nowMs: Long = clockProvider()) {
+        synchronized(lock) {
+            storage.putLong(KEY_LAST_OTA_CHECK_MS, nowMs)
+            _lastOtaCheckEpochMs.value = nowMs
         }
     }
 
@@ -547,6 +589,10 @@ class SkipFlowRepository(
         private const val KEY_AD_CURTAIN_ENABLED = "ad_curtain_enabled"
         private const val KEY_AUTO_SWIPE_SOCIAL_ADS = "auto_swipe_social_ads_enabled"
         private const val KEY_ANNOYANCE_KILLER_ENABLED = "annoyance_killer_enabled"
+        private const val KEY_SPONSOR_BLOCK_ENABLED = "sponsor_block_enabled"
+        private const val KEY_SHIZUKU_TURBO_MODE = "shizuku_turbo_mode_enabled"
+        private const val KEY_LAST_RULES_SYNC_MS = "last_rules_sync_epoch_ms"
+        private const val KEY_LAST_OTA_CHECK_MS = "last_ota_check_epoch_ms"
         private const val KEY_SNOOZE_UNTIL_EPOCH_MS = "snooze_until_epoch_ms"
         private const val KEY_SKIP_LOGS_JSON = "skip_logs_json"
         private const val KEY_FAKE_X_TRAPS_JSON = "fake_x_traps_json"
@@ -557,6 +603,7 @@ class SkipFlowRepository(
         private const val KEY_SAVED_SECONDS_TODAY = "saved_seconds_today"
 
         const val DEFAULT_SNOOZE_DURATION_MS = 10 * 60 * 1000L
+        const val OTA_DAILY_CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000L
         const val MAX_SKIP_LOGS = 50
         const val MAX_FAKE_X_TRAPS = 100
         const val FAKE_X_TTL_MS = 24 * 60 * 60 * 1000L

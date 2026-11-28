@@ -300,6 +300,8 @@ private fun methodBadgeLabel(method: SkipDetectionMethod): String {
         SkipDetectionMethod.OCR -> "OCR"
         SkipDetectionMethod.AUTO_SWIPE -> "Auto-Swipe"
         SkipDetectionMethod.ANNOYANCE_KILLER -> "منع المزعجات"
+        SkipDetectionMethod.SPONSOR_BLOCK -> "SponsorBlock"
+        SkipDetectionMethod.SHIZUKU -> "Shizuku تيربو"
     }
 }
 
@@ -310,5 +312,7 @@ private fun methodBadgeColor(method: SkipDetectionMethod): Color {
         SkipDetectionMethod.OCR -> SkipFlowColors.WarningAmber
         SkipDetectionMethod.AUTO_SWIPE -> SkipFlowColors.HealthyGreen
         SkipDetectionMethod.ANNOYANCE_KILLER -> Color(0xFFC084FC)
+        SkipDetectionMethod.SPONSOR_BLOCK -> Color(0xFF38BDF8)
+        SkipDetectionMethod.SHIZUKU -> Color(0xFFF97316)
     }
 }
